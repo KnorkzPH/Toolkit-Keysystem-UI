@@ -11,7 +11,7 @@ local LocalPlayer = Players.LocalPlayer
 local Env = (getgenv and getgenv()) or _G
 
 local Toolkit = {
-    Version = "3.4",
+    Version = "3.5",
     NotifName = "ToolkitKeysystem_Notifs",
     -- editable anytime: Toolkit.Notifications.Max / .Duration
     Notifications = { Max = 4, Duration = 4 },
@@ -73,7 +73,7 @@ Toolkit.Defaults = {
     Logo = "K",
 
     -- Premium / Freemium launcher
-    Premium = false,            -- true = PREMIUM, false = FREEMIUM
+    Premium = false,            -- true = PREMIUM, false = FREEMIUM, "both" = accepts either key
     EnforceTier = true,         -- key tier must match the launcher (else "Wrong service")
     Marker = {
         Show = true,
@@ -81,6 +81,8 @@ Toolkit.Defaults = {
         FreemiumText = "FREEMIUM",
         PremiumColor = nil,     -- default: Theme.Amber
         FreemiumColor = nil,    -- default: Theme.Blue
+        BothText = "FREEMIUM + PREMIUM", -- shown when Premium = "both"
+        BothColor = nil,        -- default: Theme.Violet
     },
 
     -- true  = notify config mistakes (wrong Junkie Service / Identifier / Provider,
@@ -119,7 +121,7 @@ Toolkit.Defaults = {
     -- Optional script link loaded after a valid key (works in any game).
     -- nil = only verify the key.
     -- (a bare token still works too, and so does the old DefaultScriptId)
-    DefaultScript = nil,
+    DefaultScript = nil,        -- string, or { Premium = "...", Freemium = "..." } picked by the key tier
 
     Timing = {
         CheckDelay = 1.4,
@@ -134,6 +136,7 @@ Toolkit.Defaults = {
         Identifier = "",
         Provider = "Mixed",
         ScriptId = nil, -- script id or the full jnkie link of the protected script
+                        -- (string, or { Premium = "...", Freemium = "..." } picked by the key tier)
         SDKUrl = "https://jnkie.com/sdk/library.lua",
     },
 
@@ -190,6 +193,34 @@ local function ResolveScript(Value)
 
     local Link = Text:match("^https?://") and Text or nil
     return Tokens, Link
+end
+
+local function PickByTier(Value, KeyIsPremium)
+    if type(Value) == "table" then
+        local Chosen
+        if KeyIsPremium then
+            Chosen = Value.Premium
+        else
+            Chosen = Value.Freemium
+        end
+        return Chosen or Value.Default
+    end
+    return Value
+end
+
+-- Maps a Junkie error string to a rejection class (shared by Launcher and CheckKey)
+--   banned | expired | mismatch | hwid | rate | service | invalid
+local function ClassifyJunkieError(Err)
+    local E = string.upper(tostring(Err or ""))
+    if E:find("BANNED") then return "banned" end            -- HWID_BANNED
+    if E:find("EXPIRED") then return "expired" end          -- KEY_EXPIRED
+    if E:find("SERVICE_MISMATCH") then return "mismatch" end -- key of another service (user mistake)
+    if E:find("HWID") then return "hwid" end                -- HWID_MISMATCH
+    if E:find("RATE_LIMIT") then return "rate" end          -- RATE_LIMITTED
+    if E:find("SERVICE") or E:find("IDENTIFIER") or E:find("PROVIDER") then
+        return "service"                                    -- wrong Junkie config (dev mistake)
+    end
+    return "invalid"
 end
 
 local White = Color3.new(1, 1, 1)
@@ -742,8 +773,9 @@ function Toolkit:Launcher(Options)
     local Handle = {}
 
     -- Premium / Freemium launcher
+    local AnyTier = Config.Premium == "both" or Config.Premium == "auto"
     local IsPremium = Config.Premium == true
-    local EnforceTier = Config.EnforceTier ~= false
+    local EnforceTier = Config.EnforceTier ~= false and not AnyTier
 
     -- start the Junkie SDK download right away
     local SDKLib, SDKDone = nil, false
@@ -1009,10 +1041,12 @@ function Toolkit:Launcher(Options)
 
     -- Premium / Freemium marker (top right of the card)
     if Config.Marker.Show ~= false then
-        local MarkerColor = IsPremium
+        local MarkerColor = AnyTier and ToColor3(Config.Marker.BothColor, Theme.Violet)
+            or IsPremium
             and ToColor3(Config.Marker.PremiumColor, Theme.Amber)
             or ToColor3(Config.Marker.FreemiumColor, Theme.Blue)
-        local MarkerText = IsPremium and Config.Marker.PremiumText or Config.Marker.FreemiumText
+        local MarkerText = AnyTier and Config.Marker.BothText
+            or (IsPremium and Config.Marker.PremiumText or Config.Marker.FreemiumText)
 
         local MarkerPill = Label(Info, {
             AnchorPoint = Vector2.new(1, 0),
@@ -1304,18 +1338,7 @@ function Toolkit:Launcher(Options)
         },
     }
 
-    local function ClassifyError(Err)
-        local E = string.upper(tostring(Err or ""))
-        if E:find("BANNED") then return "banned" end            -- HWID_BANNED
-        if E:find("EXPIRED") then return "expired" end          -- KEY_EXPIRED
-        if E:find("SERVICE_MISMATCH") then return "mismatch" end -- key of another service (user mistake)
-        if E:find("HWID") then return "hwid" end                -- HWID_MISMATCH
-        if E:find("RATE_LIMIT") then return "rate" end          -- RATE_LIMITTED
-        if E:find("SERVICE") or E:find("IDENTIFIER") or E:find("PROVIDER") then
-            return "service"                                    -- wrong Junkie config (dev mistake)
-        end
-        return "invalid"
-    end
+    local ClassifyError = ClassifyJunkieError
 
     ------------------------------------------------------------------
     -- key link (prefetched so GET KEY is instant)
@@ -1417,9 +1440,13 @@ function Toolkit:Launcher(Options)
     ------------------------------------------------------------------
     -- script loader
     ------------------------------------------------------------------
-    local function LoadAfterKey(Key)
-        local Tokens, Link = ResolveScript(Config.DefaultScript or Config.DefaultScriptId)
+    local function LoadAfterKey(Key, KeyIsPremium)
+        local Tokens, Link = ResolveScript(PickByTier(Config.DefaultScript or Config.DefaultScriptId, KeyIsPremium))
         local HasSource = (#Tokens > 0) or (Link ~= nil)
+        local TierIds = ResolveScript(PickByTier(Config.Junkie.ScriptId, KeyIsPremium))
+        if TierIds[1] then
+            Junkie.script_id = TierIds[1]
+        end
         local OriginalId = Junkie.script_id
         local LastErr = nil
 
@@ -1616,9 +1643,9 @@ function Toolkit:Launcher(Options)
                 })
             end
 
-            local SrcTokens, SrcLink = ResolveScript(Config.DefaultScript or Config.DefaultScriptId)
+            local SrcTokens, SrcLink = ResolveScript(PickByTier(Config.DefaultScript or Config.DefaultScriptId, KeyIsPremium))
             if #SrcTokens > 0 or SrcLink or Config.LoadScript ~= false then
-                local Loaded, LoadErr, HadSource = LoadAfterKey(Key)
+                local Loaded, LoadErr, HadSource = LoadAfterKey(Key, KeyIsPremium)
                 if Loaded then
                     NotifyWait()
                 else
@@ -1779,9 +1806,11 @@ function Toolkit:Launcher(Options)
         Junkie.identifier = J.Identifier or ""
         Junkie.provider = J.Provider or "Mixed"
 
-        local IdTokens = ResolveScript(J.ScriptId)
-        if IdTokens[1] then
-            Junkie.script_id = IdTokens[1]
+        if type(J.ScriptId) ~= "table" then
+            local IdTokens = ResolveScript(J.ScriptId)
+            if IdTokens[1] then
+                Junkie.script_id = IdTokens[1]
+            end
         end
 
         if SavedKey ~= "" then
@@ -1827,6 +1856,199 @@ function Toolkit:Launcher(Options)
     end
 
     return Handle
+end
+
+----------------------------------------------------------------------
+-- [5] JUNKIE FUNCTIONS (no GUI)
+--
+--   Toolkit:CheckKey(Key, Options) -> Result
+--     Headless Junkie check with premium / freemium support.
+--     Options : { Premium = false | true | "both", EnforceTier = true,
+--                 Junkie = { Service, Identifier, Provider, ScriptId, SDKUrl },
+--                 DefaultScript = nil | string | { Premium, Freemium },
+--                 LoadScript = true, SDK = <already loaded Junkie lib> }
+--     Result  : {
+--         Valid     = boolean   -- true only when the key is valid AND its tier is accepted
+--         IsPremium = boolean   -- tier of the key (Junkie check_key -> is_premium)
+--         Tier      = "Premium" | "Freemium" | nil
+--         Reason    = nil when Valid, otherwise one of:
+--                     "missing" | "config" | "sdk" | "request" | "invalid" | "expired"
+--                     "hwid" | "mismatch" | "banned" | "rate" | "service"
+--                     "premium_in_freemium" | "freemium_in_premium"
+--         Error     = raw Junkie error / message (if any)
+--         Raw       = raw table returned by Junkie.check_key
+--         Load      = function() -> ok, err   (only when Valid) loads the script for the key's tier
+--     }
+--
+--   Toolkit:VerifyAndLoad(Key, Options) -> Result
+--     check key -> valid -> tier check -> load script. Same Options as CheckKey.
+--     Result gets two extra fields: Loaded (boolean) and LoadError.
+--
+--       local R = Toolkit:VerifyAndLoad(Key, {
+--           Premium = false,                       -- true | false | "both"
+--           Junkie = { Service = "My Service", Identifier = "12345", Provider = "Mixed",
+--                      ScriptId = { Premium = "<id>", Freemium = "<id>" } },
+--           -- or DefaultScript = "https://..." | { Premium = "...", Freemium = "..." }
+--       })
+--       if not R.Valid then warn(R.Reason) end
+----------------------------------------------------------------------
+function Toolkit:CheckKey(Key, Options)
+    local Config = Merge({
+        Premium = Toolkit.Defaults.Premium,
+        EnforceTier = Toolkit.Defaults.EnforceTier,
+        LoadScript = Toolkit.Defaults.LoadScript,
+        Junkie = Toolkit.Defaults.Junkie,
+    }, Options)
+
+    local Result = { Valid = false, IsPremium = false, Tier = nil, Reason = nil, Error = nil, Raw = nil }
+
+    Key = Trim(Key)
+    if Key == "" then
+        Result.Reason = "missing"
+        return Result
+    end
+
+    local J = Config.Junkie
+    if not J.Service then
+        Result.Reason = "config"
+        Result.Error = "Junkie.Service is missing"
+        return Result
+    end
+
+    local Lib = Config.SDK
+    if not Lib then
+        local Ok, Loaded = pcall(function()
+            local Source = SafeHttpGet(J.SDKUrl)
+            if type(Source) ~= "string" then
+                error("empty response")
+            end
+            return loadstring(Source)()
+        end)
+        if not Ok or not Loaded then
+            Result.Reason = "sdk"
+            Result.Error = tostring(Loaded)
+            return Result
+        end
+        Lib = Loaded
+    end
+
+    Lib.service = J.Service
+    Lib.identifier = J.Identifier or ""
+    Lib.provider = J.Provider or "Mixed"
+
+    local Ok, Res = pcall(Lib.check_key, Key)
+    if not Ok or type(Res) ~= "table" then
+        Result.Reason = "request"
+        Result.Error = Ok and "bad response" or tostring(Res)
+        return Result
+    end
+    Result.Raw = Res
+
+    if not Res.valid then
+        Result.Error = Res.error or Res.message
+        Result.Reason = ClassifyJunkieError(Result.Error)
+        return Result
+    end
+
+    -- valid key: detect its tier (Junkie check_key -> is_premium)
+    local KeyIsPremium = Res.is_premium == true
+    Result.IsPremium = KeyIsPremium
+    Result.Tier = KeyIsPremium and "Premium" or "Freemium"
+
+    local AnyTier = Config.Premium == "both" or Config.Premium == "auto"
+    local WantPremium = Config.Premium == true
+    if Config.EnforceTier ~= false and not AnyTier then
+        if KeyIsPremium and not WantPremium then
+            Result.Reason = "premium_in_freemium"
+            return Result
+        end
+        if (not KeyIsPremium) and WantPremium then
+            Result.Reason = "freemium_in_premium"
+            return Result
+        end
+    end
+
+    Result.Valid = true
+
+    -- loads the script that belongs to this key's tier
+    Result.Load = function()
+        local Tokens, Link = ResolveScript(PickByTier(Config.DefaultScript or Config.DefaultScriptId, KeyIsPremium))
+        local TierIds = ResolveScript(PickByTier(J.ScriptId, KeyIsPremium))
+        if TierIds[1] then
+            Lib.script_id = TierIds[1]
+        end
+        local OriginalId = Lib.script_id
+        local LastErr = nil
+
+        local function Attempt()
+            local LoadOk, A, B = pcall(Lib.load_script, Key)
+            if not LoadOk then LastErr = A return false end
+            if A == false then LastErr = B or "load_script returned false" return false end
+            if type(A) == "table" and (A.success == false or A.error ~= nil) then
+                LastErr = A.error or A.message
+                return false
+            end
+            return true
+        end
+
+        for _, Token in ipairs(Tokens) do
+            Lib.script_id = Token
+            if Attempt() then return true end
+        end
+
+        if Link then
+            local Fn
+            local FetchOk, FetchErr = pcall(function()
+                local Body = SafeHttpGet(Link)
+                if type(Body) ~= "string" or Body == "" then
+                    error("empty response (404?)")
+                end
+                local Compiled, CompileErr = loadstring(Body)
+                if not Compiled then
+                    error(CompileErr)
+                end
+                Fn = Compiled
+            end)
+            if FetchOk and Fn then
+                local RunOk, RunErr = pcall(Fn)
+                if not RunOk then
+                    warn("[Toolkit] script runtime error: " .. tostring(RunErr))
+                end
+                return true
+            end
+            LastErr = FetchErr
+        end
+
+        if Config.LoadScript ~= false and OriginalId then
+            Lib.script_id = OriginalId
+            if Attempt() then return true end
+        elseif not OriginalId and #Tokens == 0 and not Link then
+            LastErr = "no script_id set (use Junkie.ScriptId or DefaultScript)"
+        end
+
+        Lib.script_id = OriginalId
+        return false, LastErr
+    end
+
+    return Result
+end
+
+function Toolkit:VerifyAndLoad(Key, Options)
+    local Result = Toolkit:CheckKey(Key, Options)
+    if not Result.Valid then
+        return Result
+    end
+
+    local Ok, Loaded, Err = pcall(Result.Load)
+    Result.Loaded = Ok and Loaded == true
+    if not Result.Loaded then
+        Result.LoadError = Ok and Err or tostring(Loaded)
+        warn("[Toolkit] load_script failed: " .. tostring(Result.LoadError))
+    else
+        Env.SCRIPT_KEY = Key
+        Env.TOOLKIT_KEY_PREMIUM = Result.IsPremium
+    end
+    return Result
 end
 
 -- usable from other scripts after the key GUI is gone: getgenv().Toolkit:Notify(...)
