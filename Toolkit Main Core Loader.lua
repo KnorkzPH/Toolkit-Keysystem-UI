@@ -1,3 +1,6 @@
+----------------------------------------------------------------------
+-- [1] LIBRARY
+----------------------------------------------------------------------
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local CoreGui = game:GetService("CoreGui")
@@ -103,7 +106,7 @@ Toolkit.Defaults = {
 
     -- Mercenary-style key flow
     GetKeyLink = "",    -- fixed key link. "" = ask Junkie (Junkie.get_key_link)
-    AutoVerify = true,  -- check a saved key automatically (rejected saved key is deleted)
+    -- (AUTO VERIFY is now a toggle button in the GUI. It starts OFF and the user turns it ON.)
     LoadScript = true,  -- after a valid key: Junkie.load_script(key). Ignored if DefaultScript is set
     WaitForKey = true,  -- Launcher() blocks until a valid key was accepted
     KickOnBan = true,   -- kick the player when Junkie reports HWID_BANNED
@@ -111,6 +114,7 @@ Toolkit.Defaults = {
     ToggleKey = Enum.KeyCode.RightShift,
 
     KeyFile = nil,      -- default: <Name>_Key.txt
+    SettingsFile = nil, -- default: <Name>_Settings.txt (stores the AUTO VERIFY toggle)
 
     -- Optional script link loaded after a valid key (works in any game).
     -- nil = only verify the key.
@@ -155,6 +159,14 @@ local function Merge(Base, Over)
     return Out
 end
 
+----------------------------------------------------------------------
+-- [2] HELPERS
+----------------------------------------------------------------------
+-- Accepts a script LINK (or a bare token). Returns Token, Link.
+--   * If a 32+ char hex token is found (e.g. inside the jnkie download link),
+--     it is returned as Token and loaded through the Junkie SDK.
+--   * Otherwise a plain http(s) link is returned as Link and loaded directly.
+--   * Anything else returns nil, nil (invalid).
 local function ResolveScript(Value)
     local Text = tostring(Value or ""):match("^%s*(.-)%s*$")
     if Text == "" then
@@ -1052,6 +1064,73 @@ function Toolkit:Launcher(Options)
         Font = Enum.Font.GothamBold,
     })
 
+    -- AUTO VERIFY toggle (right side of the YOUR KEY row).
+    -- Always OFF at first. It only turns ON when the user enables it, and that
+    -- choice is then saved on the device.
+    local SettingsFile = Config.SettingsFile or (Config.Name .. "_Settings.txt")
+    local AutoOn = false
+    do
+        local Saved = ReadFile(SettingsFile):lower()
+        local Value = Saved:match("autoverify%s*=%s*(%a+)")
+        if Value == "on" then
+            AutoOn = true
+        elseif Value == "off" then
+            AutoOn = false
+        end
+    end
+
+    local AutoToggle = New("TextButton", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 250),
+        Size = UDim2.fromOffset(120, 20),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        ZIndex = 6,
+    }, Main)
+
+    Label(AutoToggle, {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.new(1, -40, 1, 0),
+        Text = "AUTO VERIFY",
+        TextColor3 = Theme.Muted,
+        TextSize = 10,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        ZIndex = 7,
+    })
+
+    local AutoTrack = New("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, 0, 0.5, 0),
+        Size = UDim2.fromOffset(32, 16),
+        BackgroundColor3 = AutoOn and Theme.Teal or Theme.Card,
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, AutoToggle)
+    Corner(AutoTrack, 8)
+    local AutoStroke = Stroke(AutoTrack, AutoOn and Theme.Teal or Theme.Stroke, 1.2)
+
+    local AutoKnob = New("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = AutoOn and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        Size = UDim2.fromOffset(12, 12),
+        BackgroundColor3 = White,
+        BorderSizePixel = 0,
+        ZIndex = 8,
+    }, AutoTrack)
+    Corner(AutoKnob, 6)
+
+    local function PaintAuto(Animate)
+        local Time = Animate and 0.2 or 0
+        Tween(AutoTrack, Time, { BackgroundColor3 = AutoOn and Theme.Teal or Theme.Card })
+        Tween(AutoStroke, Time, { Color = AutoOn and Theme.Teal or Theme.Stroke })
+        Tween(AutoKnob, Time, {
+            Position = AutoOn and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        })
+    end
+
     local KeyBox = New("TextBox", {
         Position = UDim2.fromOffset(16, 272),
         Size = UDim2.new(1, -32, 0, 40),
@@ -1438,13 +1517,15 @@ function Toolkit:Launcher(Options)
             DestroyUI()
 
             -- optional: load a script after a valid key (works in any game)
-            local Source = Config.DefaultScript or Config.DefaultScriptId
-            if Source then
-                Toolkit:Notify("Please wait", "May take longer to load depending on jnkie servers.", "info", {
+            -- the "Wait" toast is shown only after the script load succeeded
+            local function NotifyWait()
+                Toolkit:Notify("Wait", "May take longer to load depending on jnkie servers.", "info", {
                     Duration = 8, Tag = "load",
                 })
-                task.wait()
+            end
 
+            local Source = Config.DefaultScript or Config.DefaultScriptId
+            if Source then
                 local Token, Link = ResolveScript(Source)
                 local RunOk, RunErr = false, "invalid script link"
 
@@ -1461,7 +1542,9 @@ function Toolkit:Launcher(Options)
                     end)
                 end
 
-                if not RunOk then
+                if RunOk then
+                    NotifyWait()
+                else
                     warn("[Toolkit] load_script failed: " .. tostring(RunErr))
                     Toolkit:Notify("Load failed", "Could not load the script. Try again.", "error", {
                         Duration = 6, Tag = "load",
@@ -1470,7 +1553,9 @@ function Toolkit:Launcher(Options)
             elseif Config.LoadScript ~= false then
                 -- Mercenary flow: Junkie.load_script(key) loads the script protected on the service
                 local RunOk, RunErr = pcall(Junkie.load_script, Key)
-                if not RunOk then
+                if RunOk then
+                    NotifyWait()
+                else
                     warn("[Toolkit] load_script failed: " .. tostring(RunErr))
                 end
             end
@@ -1480,6 +1565,19 @@ function Toolkit:Launcher(Options)
     ------------------------------------------------------------------
     -- wiring
     ------------------------------------------------------------------
+    AutoToggle.MouseButton1Click:Connect(function()
+        if Destroyed then return end
+        AutoOn = not AutoOn
+        WriteFile(SettingsFile, "autoverify=" .. (AutoOn and "on" or "off"))
+        PaintAuto(true)
+        Toolkit:Notify(
+            "Auto verify " .. (AutoOn and "ON" or "OFF"),
+            AutoOn and "A saved key will be checked automatically." or "You will press VERIFY KEY yourself.",
+            AutoOn and "success" or "info",
+            { Tag = "autoverify", Duration = 2.5 }
+        )
+    end)
+
     GetKeyButton.MouseButton1Click:Connect(GetKey)
     VerifyButton.MouseButton1Click:Connect(function()
         Verify()
@@ -1611,7 +1709,7 @@ function Toolkit:Launcher(Options)
         Junkie.provider = J.Provider or "Mixed"
 
         if SavedKey ~= "" then
-            if Config.AutoVerify ~= false then
+            if AutoOn then
                 SetStatus("Saved key found  •  Verifying...", Theme.Cyan)
                 task.wait(0.8)
                 if not Destroyed then
