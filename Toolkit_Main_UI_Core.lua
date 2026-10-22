@@ -131,14 +131,26 @@ Toolkit.Defaults = {
 
     -- Junkie service (REQUIRED)
     -- Only Service is required. Identifier defaults to "" and Provider to "Mixed".
+    -- Every field below is a string, or { Premium = "...", Freemium = "..." } so the
+    -- Premium and Freemium versions each get their own Junkie values:
+    --   Service / Identifier / Provider : picked by the launcher (Premium = true / false)
+    --   ScriptId                        : picked by the tier of the verified key
     Junkie = {
         Service = nil,
         Identifier = "",
         Provider = "Mixed",
         ScriptId = nil, -- script id or the full jnkie link of the protected script
-                        -- (string, or { Premium = "...", Freemium = "..." } picked by the key tier)
         SDKUrl = "https://jnkie.com/sdk/library.lua",
     },
+
+    -- Per-game scripts, each with its own Premium / Freemium link (or id).
+    -- If an entry matches the current PlaceId its links are used instead of ScriptId.
+    -- No match = nothing breaks: the key still works and ScriptId / DefaultScript is used.
+    --   Games = { { Name = "...", PlaceId = 123, Premium = "<link>", Freemium = "<link>" }, ... }
+    Games = nil,
+    -- Or keep the list online so you can add games without touching the loader.
+    -- The link must return the same table:  return { { Name = ..., PlaceId = ..., ... }, ... }
+    GamesUrl = nil,
 
     -- Colors only, same keys as Toolkit.Theme
     Theme = nil,
@@ -223,6 +235,39 @@ local function ClassifyJunkieError(Err)
     return "invalid"
 end
 
+-- Finds the entry of a Games list that belongs to the current game.
+--   Games = {
+--       { Name = "My Game", PlaceId = 123, Premium = "<link or id>", Freemium = "<link or id>" },
+--       { Name = "Other",   PlaceIds = { 1, 2 }, GameId = 456, Premium = "...", Freemium = "..." },
+--   }
+-- An entry matches by PlaceId, PlaceIds (list) or GameId (universe).
+local function ResolveGame(Games)
+    if type(Games) ~= "table" then
+        return nil
+    end
+    for _, Entry in ipairs(Games) do
+        if type(Entry) == "table" then
+            if Entry.PlaceId ~= nil and tostring(Entry.PlaceId) == tostring(game.PlaceId) then
+                return Entry
+            end
+            if Entry.GameId ~= nil and tostring(Entry.GameId) == tostring(game.GameId) then
+                return Entry
+            end
+            if type(Entry.PlaceIds) == "table" then
+                for _, Id in ipairs(Entry.PlaceIds) do
+                    if tostring(Id) == tostring(game.PlaceId) then
+                        return Entry
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Toolkit:ResolveGame(Games)
+    return ResolveGame(Games)
+end
 local White = Color3.new(1, 1, 1)
 local GLOW_IMAGE = "rbxassetid://6014261993"
 local GLOW_SLICE = Rect.new(49, 49, 450, 450)
@@ -409,6 +454,27 @@ local function SafeHttpGet(Url)
     if Ok and type(Res) == "string" then
         return Res
     end
+    return nil
+end
+
+-- Loads a games list from a link, so you can add games without touching the loader.
+-- The link must return a Lua table:  return { { Name = ..., PlaceId = ..., Premium = ..., Freemium = ... }, ... }
+local function FetchGames(Url)
+    local Ok, Result = pcall(function()
+        local Source = SafeHttpGet(Url)
+        if type(Source) ~= "string" then
+            error("empty response")
+        end
+        local Compiled, CompileErr = loadstring(Source)
+        if not Compiled then
+            error(CompileErr)
+        end
+        return Compiled()
+    end)
+    if Ok and type(Result) == "table" then
+        return Result
+    end
+    warn("[Toolkit] GamesUrl failed to load: " .. tostring(Result))
     return nil
 end
 
@@ -771,6 +837,21 @@ function Toolkit:Launcher(Options)
     RemoveGui(Config.Name)
 
     local Handle = {}
+
+    -- Games list (optional): if an entry matches this PlaceId, its Premium / Freemium links
+    -- replace ScriptId. No match = nothing changes, the normal ScriptId / DefaultScript
+    -- flow still runs, so an unlisted game is never blocked.
+    task.spawn(function()
+        local Games = Config.Games
+        if type(Games) ~= "table" and type(Config.GamesUrl) == "string" and Config.GamesUrl ~= "" then
+            Games = FetchGames(Config.GamesUrl)
+        end
+        local Entry = ResolveGame(Games)
+        if Entry then
+            Config.Junkie.ScriptId = { Premium = Entry.Premium, Freemium = Entry.Freemium }
+            Env.TOOLKIT_GAME = Entry.Name
+        end
+    end)
 
     -- Premium / Freemium launcher
     local AnyTier = Config.Premium == "both" or Config.Premium == "auto"
@@ -1532,7 +1613,6 @@ function Toolkit:Launcher(Options)
 
         local Timing = Config.Timing
         local Key = Trim(KeyBox.Text)
-
         if Key == "" then
             Report("warn", "Enter your key first, or press GET KEY.",
                 "Missing key", "Paste your key first, or press GET KEY.", { Tag = "verify" })
@@ -1795,22 +1875,24 @@ function Toolkit:Launcher(Options)
         end
 
         local J = Config.Junkie
-        if not J.Service then
+        -- Service / Identifier / Provider / ScriptId can be { Premium = "...", Freemium = "..." }
+        -- (picked by this launcher's Premium = true / false)
+        local Service = PickByTier(J.Service, IsPremium)
+        if not Service then
             Problem("error", "Junkie config missing  •  Set Junkie.Service",
                 "Config missing", "Set Junkie.Service in Launcher.", { Duration = 8, Tag = "sdk" })
             return
         end
 
         Junkie = SDKLib
-        Junkie.service = J.Service
-        Junkie.identifier = J.Identifier or ""
-        Junkie.provider = J.Provider or "Mixed"
+        Junkie.service = Service
+        Junkie.identifier = PickByTier(J.Identifier, IsPremium) or ""
+        Junkie.provider = PickByTier(J.Provider, IsPremium) or "Mixed"
 
-        if type(J.ScriptId) ~= "table" then
-            local IdTokens = ResolveScript(J.ScriptId)
-            if IdTokens[1] then
-                Junkie.script_id = IdTokens[1]
-            end
+        -- the tier-specific script id is also re-picked after the key is verified (LoadAfterKey)
+        local StartId = ResolveScript(PickByTier(J.ScriptId, IsPremium))
+        if StartId[1] then
+            Junkie.script_id = StartId[1]
         end
 
         if SavedKey ~= "" then
@@ -1884,13 +1966,32 @@ end
 --     check key -> valid -> tier check -> load script. Same Options as CheckKey.
 --     Result gets two extra fields: Loaded (boolean) and LoadError.
 --
+--       -- one script link / id per tier (a full jnkie link or just the id both work)
 --       local R = Toolkit:VerifyAndLoad(Key, {
---           Premium = false,                       -- true | false | "both"
---           Junkie = { Service = "My Service", Identifier = "12345", Provider = "Mixed",
---                      ScriptId = { Premium = "<id>", Freemium = "<id>" } },
---           -- or DefaultScript = "https://..." | { Premium = "...", Freemium = "..." }
+--           Premium = "both",                      -- true | false | "both"
+--           Service = "My Service", Identifier = "12345", Provider = "Mixed",
+--           ScriptId = {
+--               Premium  = "https://jnkie.com/...premium...",
+--               Freemium = "https://jnkie.com/...freemium...",
+--           },
 --       })
 --       if not R.Valid then warn(R.Reason) end
+--
+--       -- one entry per game, each with its own Premium / Freemium link (matched by PlaceId)
+--       local Games = {
+--           { Name = "Karinderya", PlaceId = 116497287371701,
+--             Premium = "https://api.jnkie.com/api/v1/luascripts/public/<id>/download",
+--             Freemium = "https://api.jnkie.com/api/v1/luascripts/public/<id>/download" },
+--       }
+--       Toolkit:VerifyAndLoad(Key, { Premium = "both", Service = "...", Games = Games })
+--       -- Result.Game = the matched entry (nil when the game isn't listed; it still works,
+--       -- it just uses ScriptId / DefaultScript instead).
+--       -- The same Games = Games option works in Toolkit:Launcher.
+--       -- To edit the list without touching the loader: GamesUrl = "https://.../games.lua"
+--
+--       -- separate Junkie services per version also works (Premium = true / false only):
+--       --   Service = { Premium = "My Premium", Freemium = "My Freemium" }
+--       --   Identifier / Provider can be split the same way.
 ----------------------------------------------------------------------
 function Toolkit:CheckKey(Key, Options)
     local Config = Merge({
@@ -1909,7 +2010,35 @@ function Toolkit:CheckKey(Key, Options)
     end
 
     local J = Config.Junkie
-    if not J.Service then
+
+    -- top-level Service / Identifier / Provider / ScriptId win over Junkie.*
+    for _, K in ipairs({ "Service", "Identifier", "Provider", "ScriptId" }) do
+        if Config[K] ~= nil then
+            J[K] = Config[K]
+        end
+    end
+
+    -- Games list (optional): a matching entry replaces ScriptId. No match is fine:
+    -- the key is still checked and the normal ScriptId / DefaultScript is used.
+    local Games = Config.Games
+    if type(Games) ~= "table" and type(Config.GamesUrl) == "string" and Config.GamesUrl ~= "" then
+        Games = FetchGames(Config.GamesUrl)
+    end
+    local GameEntry = ResolveGame(Games)
+    if GameEntry then
+        Result.Game = GameEntry
+        J.ScriptId = { Premium = GameEntry.Premium, Freemium = GameEntry.Freemium }
+    end
+
+    -- every one of them can be { Premium = "...", Freemium = "..." }.
+    -- Service / Identifier / Provider are picked by Options.Premium (true / false),
+    -- ScriptId is picked by the tier of the key that was just verified.
+    local LauncherPremium = Config.Premium == true
+    local Service = PickByTier(J.Service, LauncherPremium)
+    local Identifier = PickByTier(J.Identifier, LauncherPremium)
+    local Provider = PickByTier(J.Provider, LauncherPremium)
+
+    if not Service then
         Result.Reason = "config"
         Result.Error = "Junkie.Service is missing"
         return Result
@@ -1932,9 +2061,9 @@ function Toolkit:CheckKey(Key, Options)
         Lib = Loaded
     end
 
-    Lib.service = J.Service
-    Lib.identifier = J.Identifier or ""
-    Lib.provider = J.Provider or "Mixed"
+    Lib.service = Service
+    Lib.identifier = Identifier or ""
+    Lib.provider = Provider or "Mixed"
 
     local Ok, Res = pcall(Lib.check_key, Key)
     if not Ok or type(Res) ~= "table" then
@@ -2023,7 +2152,8 @@ function Toolkit:CheckKey(Key, Options)
             Lib.script_id = OriginalId
             if Attempt() then return true end
         elseif not OriginalId and #Tokens == 0 and not Link then
-            LastErr = "no script_id set (use Junkie.ScriptId or DefaultScript)"
+            LastErr = "no script_id set for the " .. tostring(Result.Tier)
+                .. " tier (set ScriptId = { Premium = \"...\", Freemium = \"...\" } or DefaultScript)"
         end
 
         Lib.script_id = OriginalId
