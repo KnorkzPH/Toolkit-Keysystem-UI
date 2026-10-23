@@ -1,0 +1,2244 @@
+-- Toolkit Keysystem
+-- Key window + toast notifications on top of the Junkie SDK.
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+local Toolkit = {
+    Version = "3.5",
+    NotifName = "ToolkitKeysystem_Notifs",
+    Notifications = { Max = 4, Duration = 4 },
+}
+
+----------------------------------------------------------------
+-- theme (colors only, sizes are fixed on purpose)
+----------------------------------------------------------------
+
+local defaultTheme = {
+    Bg = Color3.fromRGB(9, 9, 16),
+    Bg2 = Color3.fromRGB(18, 14, 34),
+    Card = Color3.fromRGB(19, 18, 32),
+    Stroke = Color3.fromRGB(42, 40, 66),
+    Text = Color3.fromRGB(242, 240, 255),
+    Muted = Color3.fromRGB(138, 135, 170),
+    Violet = Color3.fromRGB(139, 92, 255),
+    Cyan = Color3.fromRGB(34, 211, 238),
+    Pink = Color3.fromRGB(255, 77, 166),
+    Teal = Color3.fromRGB(20, 184, 166),
+    Blue = Color3.fromRGB(59, 130, 246),
+    Green = Color3.fromRGB(74, 222, 128),
+    Red = Color3.fromRGB(248, 113, 113),
+    Amber = Color3.fromRGB(251, 191, 36),
+}
+
+local theme = {}
+for key, value in pairs(defaultTheme) do
+    theme[key] = value
+end
+Toolkit.Theme = theme
+
+function Toolkit:SetTheme(overrides)
+    if type(overrides) == "table" then
+        for key, value in pairs(overrides) do
+            if defaultTheme[key] ~= nil and typeof(value) == "Color3" then
+                theme[key] = value
+            end
+        end
+    end
+    return self
+end
+
+function Toolkit:ResetTheme()
+    for key, value in pairs(defaultTheme) do
+        theme[key] = value
+    end
+    return self
+end
+
+----------------------------------------------------------------
+-- defaults
+----------------------------------------------------------------
+
+Toolkit.Defaults = {
+    Name = "ToolkitKeysystem",
+
+    Title = "TOOLKIT",
+    TitleHighlights = true,
+    TitleAccent = "KEYSYSTEM", -- "" removes it
+    TitleAccentColor = nil,    -- Color3 or "#RRGGBB", falls back to theme.Cyan
+    Tagline = "Access Beyond Ordinary",
+    Version = "v2.6",
+    Logo = "K",
+
+    -- true = PREMIUM, false = FREEMIUM, "both" = accept either key
+    Premium = false,
+    EnforceTier = true,
+    Marker = {
+        Show = true,
+        PremiumText = "PREMIUM",
+        FreemiumText = "FREEMIUM",
+        PremiumColor = nil,
+        FreemiumColor = nil,
+        BothText = "FREEMIUM + PREMIUM",
+        BothColor = nil,
+    },
+
+    -- toast + status for config mistakes (bad Service, missing script, SDK down).
+    -- user mistakes like "Invalid key" always show.
+    NotifyErrors = true,
+
+    Card = {
+        Chip = "Public",
+        Title = "Toolkit Freemium",
+        Subtitle = "Free access  •  Key required",
+        Description = "Get a free key in a few quick steps, paste it below and press VERIFY. "
+            .. "Your key is saved on this device so you won't need to repeat the steps every time.",
+    },
+
+    -- copied to clipboard on click. Empty hides the link (also hidden when Premium = true)
+    PremiumText = "Want instant access, no key steps?",
+    PremiumAction = "Get Premium",
+    Discord = "",
+
+    GetKeyLink = "",   -- fixed link, "" asks Junkie for one
+    LoadScript = true, -- false = only verify the key when no ScriptId is set
+    WaitForKey = true, -- Launcher() blocks until a key is accepted
+    KickOnBan = true,
+
+    ToggleKey = Enum.KeyCode.RightShift,
+
+    KeyFile = nil,      -- defaults to <Name>_Key.txt
+    SettingsFile = nil, -- defaults to <Name>_Settings.txt
+
+    Timing = {
+        CheckDelay = 1.4,
+        ValidDelay = 1.6,
+        FailDelay = 0.9,
+    },
+
+    -- Only Service is required. Every field can also be split per tier:
+    --   Service = { Premium = "My Premium", Freemium = "My Freemium" }
+    Junkie = {
+        Service = nil,
+        Identifier = "",
+        Provider = "",
+        ScriptId = "", -- public token, or a /luascripts/public/<id>/download link
+        SDKUrl = "https://jnkie.com/sdk/library.lua",
+    },
+
+    -- one entry per game, matched by PlaceId / PlaceIds / GameId:
+    --   Games = { { Name = "Karinderya", PlaceId = 123, Premium = "<link>", Freemium = "<link>" } }
+    -- No match is fine, ScriptId is used instead.
+    Games = nil,
+    GamesUrl = nil, -- link that returns the same table, so you can edit it without touching the loader
+
+    Theme = nil,
+
+    OnVerified = nil, -- function(key, isPremium)
+    OnClose = nil,
+}
+
+local function deepMerge(base, overrides)
+    local out = {}
+    for key, value in pairs(base) do
+        out[key] = type(value) == "table" and deepMerge(value, {}) or value
+    end
+    for key, value in pairs(overrides or {}) do
+        if type(value) == "table" and type(out[key]) == "table" then
+            out[key] = deepMerge(out[key], value)
+        else
+            out[key] = value
+        end
+    end
+    return out
+end
+
+----------------------------------------------------------------
+-- small helpers
+----------------------------------------------------------------
+
+local UUID_PATTERN = "%x%x%x%x%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%-%x%x%x%x%x%x%x%x%x%x%x%x"
+
+local function trim(text)
+    return (tostring(text or ""):match("^%s*(.-)%s*$"))
+end
+
+-- Turns a script id or link into usable pieces.
+--   parseScript("https://api.jnkie.com/api/v1/luascripts/public/<id>/download")
+--   --> { "<id>" }, "<that link>", false
+-- third value is true when text was given but isn't a link or an id.
+local function parseScript(value)
+    local text = trim(value)
+    text = text:gsub("^[\"'`]+", ""):gsub("[\"'`]+$", "")
+    text = trim(text)
+    if text == "" then
+        return {}, nil, false
+    end
+
+    local tokens, seen = {}, {}
+    local function add(token)
+        if not seen[token] then
+            seen[token] = true
+            table.insert(tokens, token)
+        end
+    end
+
+    if text:match("^https?://") then
+        if not text:match("^https?://[^%s/]+%S*$") then
+            return {}, nil, true
+        end
+        local pathId = text:match("/luascripts/public/([%w_%-]+)/download")
+        if pathId then
+            add(pathId)
+        end
+        if #tokens == 0 then
+            for part in text:gmatch(UUID_PATTERN) do
+                add(part)
+            end
+        end
+        return tokens, text, false
+    end
+
+    for part in text:gmatch(UUID_PATTERN) do
+        add(part)
+    end
+    for part in text:gmatch("%w+") do
+        if #part >= 32 and part:match("^%x+$") then
+            add(part)
+        end
+    end
+    return tokens, nil, #tokens == 0
+end
+
+-- pickByTier({ Premium = "a", Freemium = "b" }, true) --> "a"
+-- plain values pass through untouched.
+local function pickByTier(value, isPremium)
+    if type(value) == "table" then
+        local chosen = isPremium and value.Premium or value.Freemium
+        return chosen or value.Default
+    end
+    return value
+end
+
+-- numbers become text, spaces are trimmed, empty / table / boolean fall back
+local function cleanText(value, default)
+    if value == nil or type(value) == "table" or type(value) == "boolean" then
+        return default
+    end
+    local text = trim(value)
+    if text == "" then
+        return default
+    end
+    return text
+end
+
+-- junkie error string -> banned | expired | mismatch | hwid | rate | service | invalid
+local function classifyError(err)
+    local text = string.upper(tostring(err or ""))
+    if text:find("BANNED") then return "banned" end
+    if text:find("EXPIRED") then return "expired" end
+    if text:find("SERVICE_MISMATCH") then return "mismatch" end
+    if text:find("HWID") then return "hwid" end
+    if text:find("RATE_LIMIT") then return "rate" end
+    if text:find("SERVICE") or text:find("IDENTIFIER") or text:find("PROVIDER") then
+        return "service"
+    end
+    return "invalid"
+end
+
+local function findGame(games)
+    if type(games) ~= "table" then
+        return nil
+    end
+    local placeId, gameId = tostring(game.PlaceId), tostring(game.GameId)
+    for _, entry in ipairs(games) do
+        if type(entry) == "table" then
+            if entry.PlaceId ~= nil and tostring(entry.PlaceId) == placeId then
+                return entry
+            end
+            if entry.GameId ~= nil and tostring(entry.GameId) == gameId then
+                return entry
+            end
+            if type(entry.PlaceIds) == "table" then
+                for _, id in ipairs(entry.PlaceIds) do
+                    if tostring(id) == placeId then
+                        return entry
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
+function Toolkit:ResolveGame(games)
+    return findGame(games)
+end
+
+local function escapeRich(text)
+    return (tostring(text or ""):gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"))
+end
+
+-- both accept a Color3 or "#RRGGBB" / "RRGGBB"
+local function toHex(value, fallback)
+    if typeof(value) == "Color3" then
+        return value:ToHex()
+    end
+    if type(value) == "string" then
+        local hex = value:gsub("^%s*#?", ""):gsub("%s*$", "")
+        if hex:match("^%x%x%x%x%x%x$") then
+            return hex:lower()
+        end
+    end
+    return fallback:ToHex()
+end
+
+local function toColor3(value, fallback)
+    if typeof(value) == "Color3" then
+        return value
+    end
+    if type(value) == "string" then
+        local hex = value:gsub("^%s*#?", ""):gsub("%s*$", "")
+        if hex:match("^%x%x%x%x%x%x$") then
+            return Color3.fromRGB(
+                tonumber(hex:sub(1, 2), 16),
+                tonumber(hex:sub(3, 4), 16),
+                tonumber(hex:sub(5, 6), 16)
+            )
+        end
+    end
+    return fallback
+end
+
+local function copyText(text)
+    local copy = setclipboard or toclipboard or (syn and syn.write_clipboard)
+    return copy ~= nil and (pcall(copy, text))
+end
+
+local function readFile(path)
+    local ok, data = pcall(function()
+        if isfile and readfile and isfile(path) then
+            return readfile(path)
+        end
+        return ""
+    end)
+    return (ok and type(data) == "string") and data or ""
+end
+
+local function writeFile(path, data)
+    pcall(function()
+        if writefile then
+            writefile(path, data)
+        end
+    end)
+end
+
+local function deleteFile(path)
+    pcall(function()
+        if delfile and isfile and isfile(path) then
+            delfile(path)
+        end
+    end)
+end
+
+----------------------------------------------------------------
+-- http
+----------------------------------------------------------------
+
+local statusNames = {
+    [400] = "bad request",
+    [401] = "unauthorized",
+    [403] = "forbidden",
+    [404] = "not found",
+    [429] = "rate limited",
+    [500] = "server error",
+    [502] = "bad gateway",
+    [503] = "service unavailable",
+}
+
+local function describeStatus(code)
+    local name = statusNames[code]
+    return "HTTP " .. tostring(code) .. (name and (" (" .. name .. ")") or "")
+end
+
+-- error pages come back as html and must never reach loadstring
+local HTML_ERROR = "server returned an HTML page instead of a script"
+
+local function isHtml(body)
+    local head = body:sub(1, 400):gsub("^\239\187\191", ""):gsub("^%s+", ""):lower()
+    return head:find("^<!doctype") ~= nil
+        or head:find("^<html") ~= nil
+        or head:find("^<head") ~= nil
+        or head:find("^<body") ~= nil
+end
+
+local function getRequestFunction()
+    return (syn and syn.request) or (http and http.request) or http_request
+        or (fluxus and fluxus.request) or request
+end
+
+-- GET a url. Returns body, or nil + error text + status code when known.
+-- The executor request function goes first (it exposes the status code),
+-- game:HttpGet is the fallback.
+local function httpGet(url)
+    url = trim(url)
+    if not url:match("^https?://[^%s/]+%S*$") then
+        return nil, "invalid URL"
+    end
+
+    local request = getRequestFunction()
+    if request then
+        local ok, response = pcall(function()
+            return request({ Url = url, Method = "GET" })
+        end)
+        if ok and type(response) == "table" then
+            local code = tonumber(response.StatusCode) or tonumber(response.Status)
+            if code and (code < 200 or code >= 300) then
+                return nil, describeStatus(code), code
+            end
+            if type(response.Body) == "string" and response.Body ~= "" then
+                if isHtml(response.Body) then
+                    return nil, HTML_ERROR, code
+                end
+                return response.Body, nil, code
+            end
+            if code then
+                return nil, "empty response", code
+            end
+        end
+    end
+
+    local ok, body = pcall(function()
+        return game:HttpGet(url)
+    end)
+    if not ok then
+        local code = tonumber(tostring(body):match("HTTP%s*(%d%d%d)"))
+        if code then
+            return nil, describeStatus(code), code
+        end
+        return nil, tostring(body)
+    end
+    if type(body) ~= "string" or body == "" then
+        return nil, "empty response"
+    end
+    if isHtml(body) then
+        return nil, HTML_ERROR
+    end
+    return body
+end
+
+local function fetchGames(url)
+    local ok, result = pcall(function()
+        local source, err = httpGet(url)
+        if type(source) ~= "string" then
+            error(err or "empty response", 0)
+        end
+        local compiled, compileErr = loadstring(source)
+        if not compiled then
+            error(compileErr)
+        end
+        return compiled()
+    end)
+    if ok and type(result) == "table" then
+        return result
+    end
+    warn("[Toolkit] GamesUrl failed to load: " .. tostring(result))
+    return nil
+end
+
+local function loadSdk(url)
+    local ok, lib = pcall(function()
+        local source, err = httpGet(url)
+        if type(source) ~= "string" then
+            error(err or "empty response", 0)
+        end
+        return loadstring(source)()
+    end)
+    if ok and lib then
+        return lib
+    end
+    return nil, tostring(lib)
+end
+
+----------------------------------------------------------------
+-- script loading
+----------------------------------------------------------------
+
+local function resolveLoadSource(scriptId, isPremium)
+    local value = pickByTier(scriptId, isPremium)
+    local tokens, link, invalid = parseScript(value)
+    return {
+        Id = tokens[1],
+        Link = link,
+        Given = trim(value) ~= "",
+        Invalid = invalid,
+        Text = trim(value),
+    }
+end
+
+local function sdkLoadResult(ok, a, b)
+    if not ok then
+        return false, tostring(a)
+    end
+    if a == false then
+        return false, tostring(b or "load_script returned false")
+    end
+    if a == nil and b ~= nil then
+        return false, tostring(b)
+    end
+    if type(a) == "table" and (a.success == false or a.error ~= nil) then
+        return false, tostring(a.error or a.message or "load_script failed")
+    end
+    return true
+end
+
+-- returns true, or false + reason ("http" | "compile" | "runtime") + detail
+local function downloadAndRun(url, key)
+    local body, err, code = httpGet(url)
+    if not body and (code == 401 or code == 403) and not url:find("[?&]key=") then
+        local joiner = url:find("?", 1, true) and "&" or "?"
+        body, err = httpGet(url .. joiner .. "key=" .. HttpService:UrlEncode(key))
+    end
+    if not body then
+        return false, "http", err
+    end
+
+    local pcallOk, compiled, compileErr = pcall(loadstring, body)
+    if not pcallOk then
+        return false, "compile", tostring(compiled)
+    end
+    if not compiled then
+        return false, "compile", tostring(compileErr)
+    end
+
+    local runOk, runErr = pcall(compiled)
+    if not runOk then
+        return false, "runtime", tostring(runErr)
+    end
+    return true
+end
+
+-- Loads the protected script for a verified key. The SDK goes first (load_script
+-- reads getgenv().SCRIPT_KEY), a direct download is only the fallback.
+-- returns true, or false + reason + detail + sdkError
+-- reason: "bad_url" | "no_source" | "sdk" | "http" | "compile" | "runtime"
+local function loadProtected(lib, key, source)
+    if source.Invalid then
+        return false, "bad_url", source.Text
+    end
+    if not source.Id and not source.Link then
+        return false, "no_source"
+    end
+
+    local sdkErr
+    if source.Id then
+        local previous = lib.script_id
+        lib.script_id = source.Id
+
+        local ok, a, b = pcall(lib.load_script)
+        local good, err = sdkLoadResult(ok, a, b)
+        if good then
+            return true
+        end
+
+        lib.script_id = previous
+        if not source.Link then
+            return false, "sdk", err
+        end
+        sdkErr = err
+    end
+
+    local good, reason, detail = downloadAndRun(source.Link, key)
+    if good then
+        return true
+    end
+    return false, reason, detail, sdkErr
+end
+
+local loadReasons = {
+    no_source = "no script configured. Set Junkie.ScriptId to the public token of your script",
+    bad_url = "Junkie.ScriptId is not a valid script id or link",
+    sdk = "Junkie load_script failed",
+    http = "script download failed",
+    compile = "downloaded file is not valid Lua",
+    runtime = "script errored while running",
+}
+
+-- long text for the console and Result.LoadError
+local function loadFailureLog(reason, detail, sdkErr)
+    local text = loadReasons[reason] or tostring(reason)
+    if detail ~= nil and detail ~= "" then
+        text = text .. ": " .. tostring(detail)
+    end
+    if reason == "http" and tostring(detail):find("HTTP 404", 1, true) then
+        text = text .. ". Check the link and script id, and that the script is published as public in the Junkie dashboard"
+    end
+    if sdkErr ~= nil and reason ~= "sdk" then
+        text = text .. " (Junkie SDK: " .. tostring(sdkErr) .. ")"
+    end
+    return text
+end
+
+-- short text for the toast
+local function loadToastText(reason, detail)
+    detail = tostring(detail or "")
+    if reason == "no_source" then
+        return "No script set. Add your Junkie.ScriptId."
+    elseif reason == "bad_url" then
+        return "ScriptId is not a valid script id or link."
+    elseif reason == "http" then
+        if detail:find("HTTP 404", 1, true) then
+            return "Script not found (HTTP 404). Check the link / script id."
+        end
+        return "Download failed: " .. detail:sub(1, 45)
+    elseif reason == "compile" then
+        return "The downloaded file is not a valid Lua script."
+    elseif reason == "runtime" then
+        return "The script errored while running. Check the console."
+    end
+    return "Junkie could not load the script: " .. detail:sub(1, 40)
+end
+
+----------------------------------------------------------------
+-- ui helpers
+----------------------------------------------------------------
+
+local WHITE = Color3.new(1, 1, 1)
+local GLOW_IMAGE = "rbxassetid://6014261993"
+local GLOW_SLICE = Rect.new(49, 49, 450, 450)
+local BASE_WIDTH, BASE_HEIGHT = 440, 406
+
+local function kindStyle(kind)
+    local styles = {
+        info = { theme.Cyan, "i" },
+        loading = { theme.Cyan, "…" },
+        success = { theme.Green, "✓" },
+        warn = { theme.Amber, "!" },
+        error = { theme.Red, "×" },
+    }
+    local style = styles[kind or "info"] or styles.info
+    return { Color = style[1], Icon = style[2] }
+end
+
+local function make(class, props, parent)
+    local object = Instance.new(class)
+    for key, value in pairs(props or {}) do
+        object[key] = value
+    end
+    object.Parent = parent
+    return object
+end
+
+local function tween(object, time, props, style, direction)
+    local info = TweenInfo.new(time, style or Enum.EasingStyle.Quart, direction or Enum.EasingDirection.Out)
+    local t = TweenService:Create(object, info, props)
+    t:Play()
+    return t
+end
+
+local function addCorner(parent, radius)
+    return make("UICorner", { CornerRadius = UDim.new(0, radius or 10) }, parent)
+end
+
+local function addStroke(parent, color, thickness, transparency)
+    return make("UIStroke", {
+        Color = color or theme.Stroke,
+        Thickness = thickness or 1,
+        Transparency = transparency or 0,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+local function addGradient(parent, colorA, colorB, rotation)
+    return make("UIGradient", { Color = ColorSequence.new(colorA, colorB), Rotation = rotation or 0 }, parent)
+end
+
+local function addPadding(parent, left, top, right, bottom)
+    return make("UIPadding", {
+        PaddingLeft = UDim.new(0, left),
+        PaddingTop = UDim.new(0, top),
+        PaddingRight = UDim.new(0, right),
+        PaddingBottom = UDim.new(0, bottom),
+    }, parent)
+end
+
+local function addGlow(parent, color, extra, transparency, zIndex)
+    return make("ImageLabel", {
+        BackgroundTransparency = 1,
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.new(1, extra, 1, extra),
+        Image = GLOW_IMAGE,
+        ImageColor3 = color,
+        ImageTransparency = transparency,
+        ScaleType = Enum.ScaleType.Slice,
+        SliceCenter = GLOW_SLICE,
+        ZIndex = zIndex or 1,
+    }, parent)
+end
+
+local function pulse(object, prop, from, to, time)
+    object[prop] = from
+    local info = TweenInfo.new(time or 1, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut, -1, true)
+    TweenService:Create(object, info, { [prop] = to }):Play()
+end
+
+local function makeLabel(parent, props)
+    props.BackgroundTransparency = props.BackgroundTransparency or 1
+    props.ZIndex = props.ZIndex or 5
+    props.Font = props.Font or Enum.Font.Gotham
+    props.TextColor3 = props.TextColor3 or theme.Text
+    props.TextXAlignment = props.TextXAlignment or Enum.TextXAlignment.Left
+    return make("TextLabel", props, parent)
+end
+
+local function gradientButton(parent, text, size, position, colorA, colorB)
+    local holder = make("Frame", {
+        Size = size,
+        Position = position,
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, parent)
+    addCorner(holder, 10)
+    local gradient = addGradient(holder, colorA, colorB, 20)
+    local outline = addStroke(holder, WHITE, 1, 0.85)
+
+    local button = make("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = text,
+        TextColor3 = WHITE,
+        TextSize = 12,
+        Font = Enum.Font.GothamBold,
+        ZIndex = 6,
+    }, holder)
+
+    button.MouseEnter:Connect(function()
+        tween(outline, 0.18, { Transparency = 0.3 })
+        tween(gradient, 0.45, { Rotation = 200 })
+    end)
+    button.MouseLeave:Connect(function()
+        tween(outline, 0.18, { Transparency = 0.85 })
+        tween(gradient, 0.45, { Rotation = 20 })
+    end)
+    return button
+end
+
+local function iconButton(parent, text, position, hoverColor)
+    local button = make("TextButton", {
+        Size = UDim2.fromOffset(28, 28),
+        Position = position,
+        BackgroundColor3 = theme.Card,
+        BorderSizePixel = 0,
+        AutoButtonColor = false,
+        Text = text,
+        TextColor3 = theme.Muted,
+        TextSize = 16,
+        Font = Enum.Font.GothamBold,
+        ZIndex = 6,
+    }, parent)
+    addCorner(button, 8)
+    addStroke(button, theme.Stroke, 1)
+    button.MouseEnter:Connect(function()
+        tween(button, 0.15, { BackgroundColor3 = hoverColor, TextColor3 = theme.Text })
+    end)
+    button.MouseLeave:Connect(function()
+        tween(button, 0.15, { BackgroundColor3 = theme.Card, TextColor3 = theme.Muted })
+    end)
+    return button
+end
+
+local function getContainers()
+    local list = { CoreGui }
+    local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        table.insert(list, playerGui)
+    end
+    if gethui then
+        local ok, hui = pcall(gethui)
+        if ok and hui then
+            table.insert(list, hui)
+        end
+    end
+    return list
+end
+
+local function removeGui(name)
+    for _, container in ipairs(getContainers()) do
+        pcall(function()
+            local old = container:FindFirstChild(name)
+            if old then
+                old:Destroy()
+            end
+        end)
+    end
+end
+
+local function newScreenGui(name, displayOrder)
+    local gui = make("ScreenGui", {
+        Name = name,
+        ResetOnSpawn = false,
+        IgnoreGuiInset = true,
+        DisplayOrder = displayOrder,
+        ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    })
+    local ok = pcall(function()
+        gui.Parent = gethui and gethui() or CoreGui
+    end)
+    if not ok or not gui.Parent then
+        gui.Parent = player:WaitForChild("PlayerGui")
+    end
+    return gui
+end
+
+----------------------------------------------------------------
+-- notifications
+--
+--   Toolkit:Notify(title, text, kind, opts)
+--     kind: "info" | "loading" | "success" | "warn" | "error"
+--     opts: Duration, Tag, Fill, Color, Icon
+--   Returns a handle with :Dismiss(instant).
+--
+--   Toolkit:Notify("Saved", "Settings stored.", "success", { Duration = 3, Tag = "save" })
+--   (a new toast with the same Tag replaces the old one)
+--
+-- The toasts live in their own gui, so they outlast the key window.
+----------------------------------------------------------------
+
+local TOAST = {
+    Height = 68,
+    Radius = 20,
+    Gap = 10,
+    Margin = 16,
+}
+
+local notif = { Gui = nil, Holder = nil, Width = 300, Toasts = {}, Counter = 0 }
+local emptyToast = { Dismiss = function() end }
+
+local function ensureNotif()
+    if notif.Gui and notif.Gui.Parent and notif.Holder and notif.Holder.Parent then
+        return true
+    end
+
+    removeGui(Toolkit.NotifName)
+
+    local camera = workspace.CurrentCamera
+    local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+    notif.Width = math.clamp(viewport.X - TOAST.Margin * 2, 230, 300)
+    notif.Toasts = {}
+
+    notif.Gui = newScreenGui(Toolkit.NotifName, 1000000)
+    notif.Holder = make("Frame", {
+        Name = "Holder",
+        AnchorPoint = Vector2.new(1, 1),
+        Position = UDim2.new(1, -TOAST.Margin, 1, -TOAST.Margin),
+        Size = UDim2.new(0, notif.Width, 1, -TOAST.Margin * 2),
+        BackgroundTransparency = 1,
+    }, notif.Gui)
+
+    make("UIListLayout", {
+        FillDirection = Enum.FillDirection.Vertical,
+        HorizontalAlignment = Enum.HorizontalAlignment.Right,
+        VerticalAlignment = Enum.VerticalAlignment.Bottom,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, TOAST.Gap),
+    }, notif.Holder)
+
+    return true
+end
+
+function Toolkit:Notify(title, text, kind, opts)
+    if not ensureNotif() then
+        return emptyToast
+    end
+
+    opts = opts or {}
+    local style = kindStyle(kind)
+    local color = opts.Color or style.Color
+    local icon = opts.Icon or style.Icon
+    local fill = opts.Fill == true
+    local duration = opts.Duration or Toolkit.Notifications.Duration
+    local maxToasts = Toolkit.Notifications.Max
+    local offscreenX = notif.Width + 40
+    local toasts = notif.Toasts
+
+    if opts.Tag then
+        for _, toast in ipairs({ table.unpack(toasts) }) do
+            if toast.Tag == opts.Tag then
+                toast.Dismiss(true)
+            end
+        end
+    end
+    while #toasts >= maxToasts do
+        toasts[1].Dismiss(true)
+    end
+
+    notif.Counter = notif.Counter + 1
+
+    local wrap = make("Frame", {
+        Name = "Toast",
+        Size = UDim2.new(1, 0, 0, TOAST.Height),
+        BackgroundTransparency = 1,
+        LayoutOrder = -notif.Counter,
+    }, notif.Holder)
+    local slider = make("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        Position = UDim2.fromOffset(offscreenX, 0),
+        BackgroundTransparency = 1,
+    }, wrap)
+
+    addGlow(slider, color, 46, 0.84, 1)
+
+    local card = make("Frame", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 2,
+    }, slider)
+    addCorner(card, TOAST.Radius)
+    addGradient(card, theme.Bg2, theme.Bg, 135)
+    local cardStroke = addStroke(card, WHITE, 1.5, 0.2)
+    addGradient(cardStroke, color, theme.Stroke, 45)
+
+    local badge = make("Frame", {
+        Position = UDim2.fromOffset(14, 12),
+        Size = UDim2.fromOffset(36, 36),
+        BackgroundColor3 = color,
+        BackgroundTransparency = 0.82,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    }, card)
+    addCorner(badge, 18)
+    addStroke(badge, color, 1.2, 0.55)
+    local badgePop = make("UIScale", { Scale = 0 }, badge)
+    makeLabel(badge, {
+        Size = UDim2.fromScale(1, 1),
+        Text = icon,
+        TextColor3 = color,
+        TextSize = 17,
+        Font = Enum.Font.GothamBlack,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        ZIndex = 4,
+    })
+
+    makeLabel(card, {
+        Position = UDim2.fromOffset(62, 10),
+        Size = UDim2.new(1, -76, 0, 16),
+        Text = title,
+        TextSize = 13,
+        Font = Enum.Font.GothamBold,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 3,
+    })
+    makeLabel(card, {
+        Position = UDim2.fromOffset(62, 27),
+        Size = UDim2.new(1, -76, 0, 26),
+        Text = text,
+        TextColor3 = theme.Muted,
+        TextSize = 11,
+        TextWrapped = true,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        ZIndex = 3,
+    })
+
+    local track = make("Frame", {
+        Position = UDim2.new(0, 18, 1, -12),
+        Size = UDim2.new(1, -36, 0, 4),
+        BackgroundColor3 = color,
+        BackgroundTransparency = 0.85,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    }, card)
+    addCorner(track, 2)
+    local bar = make("Frame", {
+        Size = fill and UDim2.fromScale(0, 1) or UDim2.fromScale(1, 1),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    }, track)
+    addCorner(bar, 2)
+    addGradient(bar, color, color:Lerp(WHITE, 0.45), 0)
+
+    local handle = { Tag = opts.Tag, Gone = false }
+    table.insert(toasts, handle)
+
+    function handle.Dismiss(instant)
+        if handle.Gone then return end
+        handle.Gone = true
+
+        local index = table.find(toasts, handle)
+        if index then
+            table.remove(toasts, index)
+        end
+
+        if instant == true then
+            pcall(function() wrap:Destroy() end)
+            return
+        end
+
+        tween(slider, 0.25, { Position = UDim2.fromOffset(offscreenX, 0) }, Enum.EasingStyle.Quart, Enum.EasingDirection.In)
+        task.delay(0.25, function()
+            if wrap.Parent then
+                tween(wrap, 0.18, { Size = UDim2.new(1, 0, 0, 0) })
+            end
+            task.delay(0.2, function()
+                pcall(function() wrap:Destroy() end)
+            end)
+        end)
+    end
+
+    local click = make("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 8,
+    }, card)
+    click.MouseButton1Click:Connect(function() handle.Dismiss() end)
+    click.MouseEnter:Connect(function() tween(cardStroke, 0.15, { Transparency = 0 }) end)
+    click.MouseLeave:Connect(function() tween(cardStroke, 0.15, { Transparency = 0.2 }) end)
+
+    tween(slider, 0.45, { Position = UDim2.fromOffset(0, 0) }, Enum.EasingStyle.Back)
+    task.delay(0.15, function()
+        if not handle.Gone then
+            tween(badgePop, 0.4, { Scale = 1 }, Enum.EasingStyle.Back)
+        end
+    end)
+
+    -- Fill toasts stay until dismissed (or 15s after the bar is full)
+    if fill then
+        tween(bar, duration, { Size = UDim2.fromScale(1, 1) }, Enum.EasingStyle.Linear)
+        task.delay(duration + 15, handle.Dismiss)
+    else
+        tween(bar, duration, { Size = UDim2.fromScale(0, 1) }, Enum.EasingStyle.Linear)
+        task.delay(duration, handle.Dismiss)
+    end
+
+    return handle
+end
+
+----------------------------------------------------------------
+-- launcher
+--   Toolkit:Launcher(options) -> { Destroy, Show, Hide, SetStatus, Wait, IsVerified }
+----------------------------------------------------------------
+
+function Toolkit:Launcher(options)
+    local cfg = deepMerge(Toolkit.Defaults, options)
+
+    -- shorthand options, same idea as the Mercenary loaders:
+    --   Service / Identifier / Provider / ScriptId -> Junkie.*
+    --   OnSuccess -> OnVerified, Storage.FileName -> KeyFile
+    --   Links.Discord / Links.GetKey, Appearance.Title / Subtitle
+    for _, key in ipairs({ "Service", "Identifier", "Provider", "ScriptId" }) do
+        if cfg[key] ~= nil then
+            cfg.Junkie[key] = cfg[key]
+        end
+    end
+    if type(cfg.OnSuccess) == "function" and cfg.OnVerified == nil then
+        cfg.OnVerified = cfg.OnSuccess
+    end
+    if type(cfg.Storage) == "table" and cfg.Storage.FileName and cfg.KeyFile == nil then
+        cfg.KeyFile = tostring(cfg.Storage.FileName)
+    end
+    if type(cfg.Links) == "table" then
+        if cfg.Links.Discord and (cfg.Discord == nil or cfg.Discord == "") then
+            cfg.Discord = cfg.Links.Discord
+        end
+        if cfg.Links.GetKey and (cfg.GetKeyLink == nil or cfg.GetKeyLink == "") then
+            cfg.GetKeyLink = cfg.Links.GetKey
+        end
+    end
+    if type(cfg.Appearance) == "table" then
+        if cfg.Appearance.Title then cfg.Title = cfg.Appearance.Title end
+        if cfg.Appearance.Subtitle then cfg.Tagline = cfg.Appearance.Subtitle end
+    end
+
+    cfg.KeyFile = cfg.KeyFile or (cfg.Name .. "_Key.txt")
+
+    Toolkit:SetTheme(cfg.Theme)
+    if type(options) == "table" and type(options.Notifications) == "table" then
+        for key, value in pairs(options.Notifications) do
+            Toolkit.Notifications[key] = value
+        end
+    end
+
+    if Toolkit._Active then
+        pcall(Toolkit._Active.Destroy, true)
+    end
+    removeGui(cfg.Name)
+
+    local handle = {}
+
+    -- games list: a matching entry swaps ScriptId for its own Premium / Freemium links
+    local gamesReady = false
+    task.spawn(function()
+        local games = cfg.Games
+        if type(games) ~= "table" and type(cfg.GamesUrl) == "string" and cfg.GamesUrl ~= "" then
+            games = fetchGames(cfg.GamesUrl)
+        end
+        local entry = findGame(games)
+        if entry then
+            cfg.Junkie.ScriptId = { Premium = entry.Premium, Freemium = entry.Freemium }
+            env.TOOLKIT_GAME = entry.Name
+        end
+        gamesReady = true
+    end)
+
+    local acceptsAnyTier = cfg.Premium == "both" or cfg.Premium == "auto"
+    local isPremium = cfg.Premium == true
+    local enforceTier = cfg.EnforceTier ~= false and not acceptsAnyTier
+
+    -- start the SDK download right away
+    local sdkLib, sdkDone, sdkError = nil, false, nil
+    task.spawn(function()
+        sdkLib, sdkError = loadSdk(cfg.Junkie.SDKUrl)
+        if not sdkLib then
+            warn("[Toolkit] Junkie SDK failed to load: " .. tostring(sdkError))
+        end
+        sdkDone = true
+    end)
+
+    local screenGui = newScreenGui(cfg.Name, 999999)
+
+    local destroyed, busy, hidden = false, false, false
+    local verified = false
+    env.TOOLKIT_KEY_VERIFIED = false
+    local connections = {}
+    local junkie = nil
+
+    local function connect(signal, fn)
+        local connection = signal:Connect(fn)
+        table.insert(connections, connection)
+        return connection
+    end
+
+    ------------------------------------------------------------
+    -- window
+    ------------------------------------------------------------
+    local function computeScale()
+        local camera = workspace.CurrentCamera
+        local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
+        return math.clamp(math.min((viewport.X - 24) / BASE_WIDTH, (viewport.Y - 24) / BASE_HEIGHT), 0.5, 1.1)
+    end
+
+    local targetScale = computeScale()
+
+    local root = make("Frame", {
+        Name = "Root",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5),
+        Size = UDim2.fromOffset(BASE_WIDTH, BASE_HEIGHT),
+        BackgroundTransparency = 1,
+    }, screenGui)
+    local rootScale = make("UIScale", { Scale = targetScale * 0.85 }, root)
+
+    addGlow(root, theme.Teal, 70, 0.6, 1)
+
+    local main = make("Frame", {
+        Name = "Main",
+        Size = UDim2.fromScale(1, 1),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ClipsDescendants = true,
+        ZIndex = 2,
+    }, root)
+    addCorner(main, 16)
+    addGradient(main, theme.Bg2, theme.Bg, 135)
+
+    local borderStroke = addStroke(main, WHITE, 1.5, 0.1)
+    local borderGradient = make("UIGradient", {
+        Color = ColorSequence.new({
+            ColorSequenceKeypoint.new(0, theme.Teal),
+            ColorSequenceKeypoint.new(0.33, theme.Cyan),
+            ColorSequenceKeypoint.new(0.66, theme.Violet),
+            ColorSequenceKeypoint.new(1, theme.Teal),
+        }),
+    }, borderStroke)
+
+    local function makeOrb(color, x, y, size)
+        local orb = addGlow(main, color, 0, 0.72, 1)
+        orb.Position = UDim2.fromScale(x, y)
+        orb.Size = UDim2.fromOffset(size, size)
+        return orb
+    end
+    local tealOrb = makeOrb(theme.Teal, 0.12, 0.1, 340)
+    local violetOrb = makeOrb(theme.Violet, 0.95, 0.95, 320)
+
+    ------------------------------------------------------------
+    -- top bar
+    ------------------------------------------------------------
+    local topBar = make("Frame", {
+        Name = "TopBar",
+        Size = UDim2.new(1, 0, 0, 66),
+        BackgroundTransparency = 1,
+        ZIndex = 5,
+    }, main)
+
+    local logo = make("Frame", {
+        Size = UDim2.fromOffset(40, 40),
+        Position = UDim2.fromOffset(16, 13),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, topBar)
+    addCorner(logo, 12)
+    local logoGradient = addGradient(logo, theme.Teal, theme.Blue, 45)
+    addStroke(logo, WHITE, 1, 0.75)
+    makeLabel(logo, {
+        Size = UDim2.fromScale(1, 1),
+        Text = cfg.Logo,
+        TextColor3 = WHITE,
+        TextSize = 22,
+        Font = Enum.Font.GothamBlack,
+        TextXAlignment = Enum.TextXAlignment.Center,
+    })
+
+    -- TitleHighlights = true colors the accent, false leaves it plain
+    local titleText = escapeRich(cfg.Title)
+    if trim(cfg.TitleAccent) ~= "" then
+        if cfg.TitleHighlights == true then
+            titleText = titleText .. ' <font color="#' .. toHex(cfg.TitleAccentColor, theme.Cyan) .. '">'
+                .. escapeRich(cfg.TitleAccent) .. "</font>"
+        else
+            titleText = titleText .. " " .. escapeRich(cfg.TitleAccent)
+        end
+    end
+    makeLabel(topBar, {
+        Position = UDim2.fromOffset(66, 12),
+        Size = UDim2.new(1, -170, 0, 24),
+        RichText = true,
+        Text = titleText,
+        TextSize = 18,
+        Font = Enum.Font.GothamBlack,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+
+    local taglineText = cfg.Tagline
+    if trim(cfg.Version) ~= "" then
+        taglineText = taglineText .. "  •  " .. cfg.Version
+    end
+    makeLabel(topBar, {
+        Position = UDim2.fromOffset(66, 37),
+        Size = UDim2.new(1, -170, 0, 14),
+        Text = taglineText,
+        TextColor3 = theme.Muted,
+        TextSize = 10,
+        Font = Enum.Font.GothamMedium,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+
+    local closeButton = iconButton(topBar, "×", UDim2.new(1, -44, 0, 19), theme.Red)
+    local minimizeButton = iconButton(topBar, "–", UDim2.new(1, -78, 0, 19), theme.Teal)
+
+    local divider = make("Frame", {
+        Position = UDim2.fromOffset(16, 65),
+        Size = UDim2.new(1, -32, 0, 1),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, main)
+    make("UIGradient", {
+        Color = ColorSequence.new(theme.Teal, theme.Cyan),
+        Transparency = NumberSequence.new(0.2, 1),
+    }, divider)
+
+    ------------------------------------------------------------
+    -- status bar
+    ------------------------------------------------------------
+    local statusBar = make("Frame", {
+        Position = UDim2.fromOffset(16, 78),
+        Size = UDim2.new(1, -32, 0, 48),
+        BackgroundColor3 = theme.Card:Lerp(theme.Green, 0.16),
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, main)
+    addCorner(statusBar, 12)
+    local statusStroke = addStroke(statusBar, theme.Green, 1.5, 0)
+
+    local statusDot = make("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        Position = UDim2.new(0, 14, 0.5, -7),
+        BackgroundColor3 = theme.Green,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, statusBar)
+    addCorner(statusDot, 7)
+    pulse(statusDot, "BackgroundTransparency", 0, 0.5, 0.8)
+
+    local statusLabel = makeLabel(statusBar, {
+        Position = UDim2.fromOffset(38, 0),
+        Size = UDim2.new(1, -50, 1, 0),
+        Text = "Ready  •  Get a key or paste yours",
+        TextColor3 = WHITE,
+        TextSize = 14,
+        Font = Enum.Font.GothamBold,
+        TextWrapped = true,
+        ZIndex = 6,
+    })
+
+    local statusTweens = {}
+    local function setStatus(text, color)
+        if destroyed then return end
+        color = color or theme.Green
+        statusLabel.Text = text
+
+        for _, t in ipairs(statusTweens) do
+            t:Cancel()
+        end
+        statusStroke.Color = color
+        statusStroke.Thickness = 3.5
+        statusTweens = {
+            tween(statusDot, 0.2, { BackgroundColor3 = color }),
+            tween(statusBar, 0.25, { BackgroundColor3 = theme.Card:Lerp(color, 0.16) }),
+            tween(statusStroke, 0.6, { Thickness = 1.5 }),
+        }
+    end
+
+    -- status line + toast together
+    local function report(kind, statusText, title, text, opts)
+        local color = (opts and opts.Color) or kindStyle(kind).Color
+        setStatus(statusText, color)
+        Toolkit:Notify(title, text, kind, opts)
+    end
+
+    -- config mistakes only show up when NotifyErrors is on
+    local function problem(kind, statusText, title, text, opts)
+        if cfg.NotifyErrors == true then
+            report(kind, statusText, title, text, opts)
+        else
+            setStatus("Ready  •  Paste your key and press VERIFY", theme.Cyan)
+        end
+    end
+
+    -- set at startup when the SDK can't be used, shown if the user presses a button anyway
+    local startupError = nil
+    local function notReady()
+        if startupError and cfg.NotifyErrors == true then
+            setStatus(startupError, theme.Red)
+        else
+            setStatus("Junkie SDK isn't ready yet. Try again in a moment.", theme.Amber)
+        end
+    end
+
+    ------------------------------------------------------------
+    -- info card
+    ------------------------------------------------------------
+    local infoCard = make("Frame", {
+        Position = UDim2.fromOffset(16, 138),
+        Size = UDim2.new(1, -32, 0, 104),
+        BackgroundColor3 = theme.Card,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, main)
+    addCorner(infoCard, 14)
+    addGradient(addStroke(infoCard, WHITE, 1.2, 0.1), theme.Teal, theme.Blue, 45)
+
+    local chip = makeLabel(infoCard, {
+        Position = UDim2.fromOffset(14, 12),
+        Size = UDim2.fromOffset(0, 18),
+        AutomaticSize = Enum.AutomaticSize.X,
+        BackgroundTransparency = 0.82,
+        BackgroundColor3 = theme.Teal,
+        Text = cfg.Card.Chip,
+        TextColor3 = theme.Teal:Lerp(WHITE, 0.35),
+        TextSize = 9,
+        Font = Enum.Font.GothamBold,
+    })
+    addCorner(chip, 6)
+    addPadding(chip, 8, 0, 8, 0)
+
+    if cfg.Marker.Show ~= false then
+        local markerColor, markerText
+        if acceptsAnyTier then
+            markerColor = toColor3(cfg.Marker.BothColor, theme.Violet)
+            markerText = cfg.Marker.BothText
+        elseif isPremium then
+            markerColor = toColor3(cfg.Marker.PremiumColor, theme.Amber)
+            markerText = cfg.Marker.PremiumText
+        else
+            markerColor = toColor3(cfg.Marker.FreemiumColor, theme.Blue)
+            markerText = cfg.Marker.FreemiumText
+        end
+
+        local marker = makeLabel(infoCard, {
+            AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -14, 0, 12),
+            Size = UDim2.fromOffset(0, 18),
+            AutomaticSize = Enum.AutomaticSize.X,
+            BackgroundTransparency = 0.82,
+            BackgroundColor3 = markerColor,
+            Text = tostring(markerText),
+            TextColor3 = markerColor:Lerp(WHITE, 0.35),
+            TextSize = 9,
+            Font = Enum.Font.GothamBold,
+        })
+        addCorner(marker, 6)
+        addPadding(marker, 8, 0, 8, 0)
+        addStroke(marker, markerColor, 1, 0.6)
+    end
+
+    local infoTitle = makeLabel(infoCard, {
+        Position = UDim2.fromOffset(14, 34),
+        Size = UDim2.new(1, -28, 0, 22),
+        Text = cfg.Card.Title,
+        TextColor3 = WHITE,
+        TextSize = 18,
+        Font = Enum.Font.GothamBlack,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    addGradient(infoTitle, theme.Teal:Lerp(WHITE, 0.25), theme.Blue:Lerp(WHITE, 0.25), 0)
+
+    makeLabel(infoCard, {
+        Position = UDim2.fromOffset(14, 56),
+        Size = UDim2.new(1, -28, 0, 14),
+        Text = cfg.Card.Subtitle,
+        TextColor3 = theme.Cyan,
+        TextSize = 11,
+        Font = Enum.Font.GothamMedium,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    })
+    makeLabel(infoCard, {
+        Position = UDim2.fromOffset(14, 72),
+        Size = UDim2.new(1, -28, 0, 28),
+        Text = cfg.Card.Description,
+        TextColor3 = theme.Muted,
+        TextSize = 10,
+        TextWrapped = true,
+        TextYAlignment = Enum.TextYAlignment.Top,
+    })
+
+    ------------------------------------------------------------
+    -- key row and buttons
+    ------------------------------------------------------------
+    makeLabel(main, {
+        Position = UDim2.fromOffset(18, 254),
+        Size = UDim2.fromOffset(200, 14),
+        Text = "YOUR KEY",
+        TextColor3 = theme.Muted,
+        TextSize = 10,
+        Font = Enum.Font.GothamBold,
+    })
+
+    -- AUTO VERIFY starts off, the choice is saved on the device
+    local settingsFile = cfg.SettingsFile or (cfg.Name .. "_Settings.txt")
+    local autoOn = false
+    do
+        local saved = readFile(settingsFile):lower()
+        autoOn = saved:match("autoverify%s*=%s*(%a+)") == "on"
+    end
+
+    local autoToggle = make("TextButton", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -16, 0, 250),
+        Size = UDim2.fromOffset(120, 20),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        Text = "",
+        ZIndex = 6,
+    }, main)
+
+    makeLabel(autoToggle, {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        Size = UDim2.new(1, -40, 1, 0),
+        Text = "AUTO VERIFY",
+        TextColor3 = theme.Muted,
+        TextSize = 10,
+        Font = Enum.Font.GothamBold,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        ZIndex = 7,
+    })
+
+    local autoTrack = make("Frame", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, 0, 0.5, 0),
+        Size = UDim2.fromOffset(32, 16),
+        BackgroundColor3 = autoOn and theme.Teal or theme.Card,
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, autoToggle)
+    addCorner(autoTrack, 8)
+    local autoStroke = addStroke(autoTrack, autoOn and theme.Teal or theme.Stroke, 1.2)
+
+    local autoKnob = make("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = autoOn and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        Size = UDim2.fromOffset(12, 12),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        ZIndex = 8,
+    }, autoTrack)
+    addCorner(autoKnob, 6)
+
+    local function paintAuto()
+        tween(autoTrack, 0.2, { BackgroundColor3 = autoOn and theme.Teal or theme.Card })
+        tween(autoStroke, 0.2, { Color = autoOn and theme.Teal or theme.Stroke })
+        tween(autoKnob, 0.2, {
+            Position = autoOn and UDim2.new(1, -14, 0.5, 0) or UDim2.new(0, 2, 0.5, 0),
+        })
+    end
+
+    local keyBox = make("TextBox", {
+        Position = UDim2.fromOffset(16, 272),
+        Size = UDim2.new(1, -32, 0, 40),
+        BackgroundColor3 = theme.Card,
+        BorderSizePixel = 0,
+        Text = "",
+        PlaceholderText = "Paste your key here...",
+        PlaceholderColor3 = theme.Muted,
+        TextColor3 = theme.Text,
+        TextSize = 13,
+        Font = Enum.Font.GothamMedium,
+        ClearTextOnFocus = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 5,
+    }, main)
+    addCorner(keyBox, 10)
+    addPadding(keyBox, 12, 0, 12, 0)
+    local keyStroke = addStroke(keyBox, theme.Stroke, 1.2)
+
+    local getKeyButton = gradientButton(
+        main, "GET KEY",
+        UDim2.fromOffset(198, 40), UDim2.fromOffset(16, 324),
+        theme.Teal, theme.Blue
+    )
+    local verifyButton = gradientButton(
+        main, "VERIFY KEY",
+        UDim2.fromOffset(198, 40), UDim2.fromOffset(226, 324),
+        theme.Violet, theme.Pink
+    )
+
+    local premiumLink = make("TextButton", {
+        Position = UDim2.fromOffset(16, 372),
+        Size = UDim2.new(1, -32, 0, 18),
+        BackgroundTransparency = 1,
+        AutoButtonColor = false,
+        RichText = true,
+        Text = escapeRich(cfg.PremiumText) .. '  <font color="#' .. theme.Pink:ToHex() .. '"><b>'
+            .. escapeRich(cfg.PremiumAction) .. "</b></font>",
+        TextColor3 = theme.Muted,
+        TextSize = 11,
+        Font = Enum.Font.GothamMedium,
+        Visible = (trim(cfg.Discord) ~= "") and not isPremium,
+        ZIndex = 5,
+    }, main)
+
+    ------------------------------------------------------------
+    -- minimized bubble
+    ------------------------------------------------------------
+    local bubble = make("Frame", {
+        Size = UDim2.fromOffset(48, 48),
+        Position = UDim2.new(1, -64, 0.5, -24),
+        BackgroundColor3 = WHITE,
+        BorderSizePixel = 0,
+        Visible = false,
+    }, screenGui)
+    addCorner(bubble, 24)
+    addGradient(bubble, theme.Teal, theme.Blue, 45)
+    addStroke(bubble, WHITE, 1.5, 0.6)
+    local bubbleButton = make("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = cfg.Logo,
+        TextColor3 = WHITE,
+        TextSize = 20,
+        Font = Enum.Font.GothamBlack,
+    }, bubble)
+
+    local function setHidden(value)
+        if destroyed then return end
+        hidden = value
+        root.Visible = not value
+        bubble.Visible = value
+    end
+
+    local function destroyUi(instant)
+        if destroyed then return end
+        destroyed, busy = true, true
+
+        for _, connection in ipairs(connections) do
+            connection:Disconnect()
+        end
+        if Toolkit._Active == handle then
+            Toolkit._Active = nil
+        end
+
+        if instant == true then
+            screenGui:Destroy()
+            return
+        end
+
+        tween(rootScale, 0.25, { Scale = 0.8 }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+        task.delay(0.28, function()
+            screenGui:Destroy()
+        end)
+    end
+
+    ------------------------------------------------------------
+    -- rejection messages
+    -- Dev = true means a config mistake, only shown when NotifyErrors is on
+    ------------------------------------------------------------
+    local rejections = {
+        invalid = {
+            Kind = "error",
+            Title = "Invalid key",
+            Text = "That key isn't valid. Check it and try again.",
+            Status = "Invalid key  •  Check it and try again",
+        },
+        expired = {
+            Kind = "warn",
+            Title = "Key expired",
+            Text = "This key has expired. Press GET KEY for a new one.",
+            Status = "Key expired  •  Press GET KEY for a new one",
+        },
+        hwid = {
+            Kind = "error",
+            Title = "Key locked",
+            Text = "HWID limit reached for this key.",
+            Status = "HWID limit reached for this key",
+        },
+        mismatch = {
+            Kind = "error",
+            Title = "Wrong service",
+            Text = "This key is for a different service.",
+            Status = "Key is for a different service",
+        },
+        banned = {
+            Kind = "error",
+            Title = "Hardware banned",
+            Text = "This device is banned from the service.",
+            Status = "Hardware banned",
+        },
+        rate = {
+            Kind = "warn",
+            Title = "Slow down",
+            Text = "Too many attempts. Wait a bit then try again.",
+            Status = "Too many attempts  •  Wait a bit then try again",
+        },
+        service = {
+            Kind = "error",
+            Title = "Invalid Junkie service",
+            Text = "Service, Identifier or Provider is wrong. Check your Launcher config.",
+            Status = "Invalid Junkie service  •  Check Service, Identifier and Provider",
+            Dev = true,
+        },
+        premium_in_freemium = {
+            Kind = "error",
+            Title = "Wrong service",
+            Text = "This is a Premium key. It can't be redeemed in the Freemium version.",
+            Status = "Wrong service  •  This is a Premium key, use the Premium version",
+        },
+        freemium_in_premium = {
+            Kind = "error",
+            Title = "Wrong service",
+            Text = "This is a Freemium key. It can't be redeemed in the Premium version.",
+            Status = "Wrong service  •  This is a Freemium key, use the Freemium version",
+        },
+    }
+
+    ------------------------------------------------------------
+    -- key link (prefetched so GET KEY feels instant)
+    ------------------------------------------------------------
+    local savedKey = trim(readFile(cfg.KeyFile))
+
+    local LINK_TTL = 240
+    local linkCache = { Link = nil, Err = nil, At = 0, Fetching = false }
+    local gettingLink = false
+
+    local function linkIsFresh()
+        return linkCache.Link ~= nil and (os.clock() - linkCache.At) < LINK_TTL
+    end
+
+    local function fetchLink()
+        if linkIsFresh() then
+            return linkCache.Link, nil
+        end
+        if linkCache.Fetching then
+            while linkCache.Fetching do
+                task.wait()
+            end
+            return linkCache.Link, linkCache.Err
+        end
+
+        linkCache.Fetching = true
+        local ok, link, err = pcall(junkie.get_key_link)
+        if not ok then
+            ok, link, err = pcall(junkie.get_key_link)
+        end
+
+        if ok and type(link) == "string" and link ~= "" then
+            linkCache.Link, linkCache.Err, linkCache.At = link, nil, os.clock()
+        else
+            linkCache.Link = nil
+            linkCache.Err = ok and (err or "ERROR") or "REQUEST_FAILED"
+        end
+        linkCache.Fetching = false
+        return linkCache.Link, linkCache.Err
+    end
+
+    local function deliverLink(link, err)
+        if destroyed then return end
+        local opts = { Tag = "link" }
+
+        if link then
+            if copyText(link) then
+                report("success", "Key link copied!  •  Paste it in your browser",
+                    "Key link copied", "Paste it in your browser to get your key.", opts)
+            else
+                keyBox.Text = link
+                report("warn", "Clipboard unavailable  •  Link placed in the box, copy it manually",
+                    "Clipboard unavailable", "The link was placed in the key box. Copy it manually.", opts)
+            end
+        elseif err == "RATE_LIMITTED" then
+            report("warn", "Too many requests  •  Wait a bit then try again",
+                "Too many requests", "Wait a bit then try again.", opts)
+        elseif err == "REQUEST_FAILED" then
+            report("error", "Could not request a key link. Try again.",
+                "Request failed", "Could not request a key link. Try again.", opts)
+        elseif classifyError(err) == "service" then
+            local r = rejections.service
+            problem(r.Kind, r.Status, r.Title, r.Text, opts)
+        else
+            warn("[Toolkit] get_key_link: " .. tostring(err))
+            report("warn", "Link not ready  •  Please wait ~5 minutes then try again",
+                "Link not ready", "Please wait about 5 minutes then press GET KEY again.", opts)
+        end
+    end
+
+    local function getKey()
+        if busy or gettingLink or destroyed then return end
+
+        if type(cfg.GetKeyLink) == "string" and cfg.GetKeyLink ~= "" then
+            deliverLink(cfg.GetKeyLink, nil)
+            return
+        end
+
+        if not junkie then
+            notReady()
+            return
+        end
+
+        if linkIsFresh() then
+            deliverLink(linkCache.Link, nil)
+            return
+        end
+
+        gettingLink = true
+        setStatus("Requesting your key link...", theme.Cyan)
+        task.spawn(function()
+            local link, err = fetchLink()
+            gettingLink = false
+            deliverLink(link, err)
+        end)
+    end
+
+    ------------------------------------------------------------
+    -- verify
+    ------------------------------------------------------------
+    local function verify()
+        if busy or destroyed then return end
+
+        local timing = cfg.Timing
+        local key = trim(keyBox.Text)
+        if key == "" then
+            report("warn", "Enter your key first, or press GET KEY.",
+                "Missing key", "Paste your key first, or press GET KEY.", { Tag = "verify" })
+            return
+        end
+        if not junkie then
+            notReady()
+            return
+        end
+
+        busy = true
+        local startedAt = os.clock()
+        setStatus("Checking your key...", theme.Cyan)
+        local checking = Toolkit:Notify("Checking key", "Contacting the key server...", "loading", {
+            Fill = true, Duration = timing.CheckDelay, Tag = "verify",
+        })
+
+        task.spawn(function()
+            local ok, result = pcall(junkie.check_key, key)
+
+            -- keep the loading toast up for at least CheckDelay
+            local remaining = timing.CheckDelay - (os.clock() - startedAt)
+            if remaining > 0 then
+                task.wait(remaining)
+            end
+            if destroyed then return end
+            checking.Dismiss(true)
+
+            local function fail(kind, statusText, title, text, isDev)
+                local opts = { Tag = "verify", Duration = 5 }
+                if isDev then
+                    problem(kind, statusText, title, text, opts)
+                else
+                    report(kind, statusText, title, text, opts)
+                end
+                task.wait(timing.FailDelay)
+                if not destroyed then
+                    busy = false
+                end
+            end
+
+            if not ok or type(result) ~= "table" then
+                return fail("error", "Could not check the key. Try again.",
+                    "Check failed", "Couldn't reach the key server. Try again.")
+            end
+
+            if not result.valid then
+                local class = classifyError(result.error or result.message)
+
+                if class == "banned" then
+                    if cfg.KickOnBan == true then
+                        pcall(function()
+                            player:Kick("Hardware banned")
+                        end)
+                    end
+                    local r = rejections.banned
+                    return fail(r.Kind, r.Status, r.Title, r.Text, false)
+                end
+
+                -- a saved key that gets rejected is dropped so it isn't retried forever
+                if key == savedKey and (class == "invalid" or class == "expired"
+                    or class == "hwid" or class == "mismatch") then
+                    deleteFile(cfg.KeyFile)
+                    savedKey = ""
+                end
+
+                local r = rejections[class]
+                return fail(r.Kind, r.Status, r.Title, r.Text, r.Dev == true)
+            end
+
+            local keyIsPremium = result.is_premium == true
+
+            if enforceTier then
+                if keyIsPremium and not isPremium then
+                    local r = rejections.premium_in_freemium
+                    return fail(r.Kind, r.Status, r.Title, r.Text, false)
+                end
+                if (not keyIsPremium) and isPremium then
+                    local r = rejections.freemium_in_premium
+                    return fail(r.Kind, r.Status, r.Title, r.Text, false)
+                end
+            end
+
+            -- only now is the key saved and exposed
+            writeFile(cfg.KeyFile, key)
+            env.SCRIPT_KEY = key
+            env.TOOLKIT_KEY_VERIFIED = true
+            env.TOOLKIT_KEY_PREMIUM = keyIsPremium
+            verified = true
+            if type(cfg.OnVerified) == "function" then
+                task.spawn(cfg.OnVerified, key, keyIsPremium)
+            end
+
+            local tierName = keyIsPremium and "Premium" or "Freemium"
+            report("success", tierName .. " key valid  •  Access granted",
+                tierName .. " key valid", "Access granted.", { Tag = "verify" })
+
+            task.wait(timing.ValidDelay)
+            if destroyed then return end
+            destroyUi()
+
+            -- wait (up to 10s) for the games list so the right script is picked
+            local waitedFrom = os.clock()
+            while not gamesReady and os.clock() - waitedFrom < 10 do
+                task.wait()
+            end
+
+            local source = resolveLoadSource(cfg.Junkie.ScriptId, keyIsPremium)
+            if source.Given or cfg.LoadScript ~= false then
+                local loaded, reason, detail, sdkErr = loadProtected(junkie, key, source)
+                if loaded then
+                    Toolkit:Notify("Wait", "May take longer to load depending on jnkie servers.", "info", {
+                        Duration = 8, Tag = "load",
+                    })
+                else
+                    warn("[Toolkit] load failed: " .. loadFailureLog(reason, detail, sdkErr))
+                    local text = loadToastText(reason, detail)
+                    if reason == "no_source" or reason == "bad_url" then
+                        problem("error", text, reason == "bad_url" and "Invalid script link" or "Script not set", text, {
+                            Duration = 8, Tag = "load",
+                        })
+                    else
+                        Toolkit:Notify("Load failed", text, "error", {
+                            Duration = 6, Tag = "load",
+                        })
+                    end
+                end
+            end
+        end)
+    end
+
+    ------------------------------------------------------------
+    -- wiring
+    ------------------------------------------------------------
+    autoToggle.MouseButton1Click:Connect(function()
+        if destroyed then return end
+        autoOn = not autoOn
+        writeFile(settingsFile, "autoverify=" .. (autoOn and "on" or "off"))
+        paintAuto()
+        Toolkit:Notify(
+            "Auto verify " .. (autoOn and "ON" or "OFF"),
+            autoOn and "A saved key will be checked automatically." or "You will press VERIFY KEY yourself.",
+            autoOn and "success" or "info",
+            { Tag = "autoverify", Duration = 2.5 }
+        )
+    end)
+
+    getKeyButton.MouseButton1Click:Connect(getKey)
+    verifyButton.MouseButton1Click:Connect(verify)
+
+    keyBox.Focused:Connect(function()
+        tween(keyStroke, 0.15, { Color = theme.Teal })
+    end)
+    keyBox.FocusLost:Connect(function(enterPressed)
+        tween(keyStroke, 0.15, { Color = theme.Stroke })
+        if enterPressed then
+            verify()
+        end
+    end)
+
+    premiumLink.MouseButton1Click:Connect(function()
+        if destroyed then return end
+        if copyText(cfg.Discord) then
+            report("success", "Discord invite copied  •  Premium is sold there",
+                "Discord invite copied", "Premium is sold there.", { Tag = "discord", Color = theme.Pink })
+        else
+            report("error", "Unable to copy the Discord invite.",
+                "Copy failed", "Unable to copy the Discord invite.", { Tag = "discord" })
+        end
+    end)
+
+    closeButton.MouseButton1Click:Connect(function()
+        if destroyed then return end
+        destroyUi()
+        Toolkit:Notify("Closed", "Key system closed. See you next time.", "error", {
+            Duration = 3.5, Tag = "close",
+        })
+        if type(cfg.OnClose) == "function" then
+            task.spawn(cfg.OnClose)
+        end
+    end)
+    minimizeButton.MouseButton1Click:Connect(function() setHidden(true) end)
+    bubbleButton.MouseButton1Click:Connect(function() setHidden(false) end)
+
+    connect(UserInputService.InputBegan, function(input, processed)
+        if processed or destroyed then return end
+        if input.KeyCode == cfg.ToggleKey then
+            setHidden(not hidden)
+        end
+    end)
+
+    -- dragging by the top bar
+    local dragging, dragStart, startPosition, dragInput = false, nil, nil, nil
+
+    local function isPointer(input)
+        return input.UserInputType == Enum.UserInputType.MouseButton1
+            or input.UserInputType == Enum.UserInputType.Touch
+    end
+
+    topBar.InputBegan:Connect(function(input)
+        if not isPointer(input) then return end
+        dragging = true
+        dragStart = input.Position
+        startPosition = root.Position
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end)
+
+    topBar.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement
+            or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+
+    connect(UserInputService.InputChanged, function(input)
+        if input == dragInput and dragging then
+            local delta = (input.Position - dragStart) / rootScale.Scale
+            root.Position = UDim2.new(
+                startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+
+    -- background animation, paused while minimized
+    local elapsed = 0
+    connect(RunService.Heartbeat, function(dt)
+        if hidden then return end
+        elapsed = elapsed + dt
+        borderGradient.Rotation = (elapsed * 45) % 360
+        logoGradient.Rotation = (elapsed * 60) % 360
+        tealOrb.Position = UDim2.fromScale(0.12 + math.sin(elapsed * 0.5) * 0.07, 0.1 + math.cos(elapsed * 0.4) * 0.06)
+        violetOrb.Position = UDim2.fromScale(0.95 + math.cos(elapsed * 0.45) * 0.07, 0.95 + math.sin(elapsed * 0.35) * 0.06)
+    end)
+
+    ------------------------------------------------------------
+    -- startup
+    ------------------------------------------------------------
+    tween(rootScale, 0.4, { Scale = targetScale }, Enum.EasingStyle.Back)
+    setStatus("Connecting to key service...", theme.Cyan)
+
+    if savedKey ~= "" then
+        keyBox.Text = savedKey
+    end
+
+    task.spawn(function()
+        while not sdkDone and not destroyed do
+            task.wait()
+        end
+        if destroyed then return end
+
+        if not sdkLib then
+            startupError = "Junkie SDK failed to load  •  Check your connection and SDKUrl"
+            problem("error", "Key service unreachable  •  Check your connection",
+                "SDK failed", "Could not load the Junkie SDK. Check your connection.", { Duration = 6, Tag = "sdk" })
+            return
+        end
+
+        local j = cfg.Junkie
+        local service = cleanText(pickByTier(j.Service, isPremium), nil)
+        if not service then
+            startupError = "Junkie config missing  •  Set Junkie.Service"
+            problem("error", "Junkie config missing  •  Set Junkie.Service",
+                "Config missing", "Set Junkie.Service in Launcher.", { Duration = 8, Tag = "sdk" })
+            return
+        end
+
+        junkie = sdkLib
+        junkie.service = service
+        junkie.identifier = cleanText(pickByTier(j.Identifier, isPremium), "")
+        junkie.provider = cleanText(pickByTier(j.Provider, isPremium), nil)
+
+        -- set now, resolved again after verify since the key's tier can pick another script
+        local startSource = resolveLoadSource(j.ScriptId, isPremium)
+        if startSource.Id then
+            junkie.script_id = startSource.Id
+        end
+
+        if savedKey ~= "" then
+            if autoOn then
+                setStatus("Saved key found  •  Verifying...", theme.Cyan)
+                task.wait(0.8)
+                if not destroyed then
+                    verify()
+                end
+            else
+                setStatus("Saved key found  •  Press VERIFY KEY", theme.Cyan)
+            end
+        else
+            setStatus("Ready  •  Get a key or paste yours", theme.Green)
+            task.spawn(fetchLink)
+        end
+    end)
+
+    -- Blocks until a key is accepted. If the window is closed first it never
+    -- returns, so whatever comes after Launcher() never runs.
+    local function waitForKey()
+        while not verified do
+            if destroyed then
+                while true do
+                    task.wait(1)
+                end
+            end
+            task.wait(0.1)
+        end
+    end
+
+    handle.Destroy = destroyUi
+    handle.Show = function() setHidden(false) end
+    handle.Hide = function() setHidden(true) end
+    handle.SetStatus = setStatus
+    handle.Wait = waitForKey
+    handle.IsVerified = function() return verified end
+    Toolkit._Active = handle
+
+    if cfg.WaitForKey == true then
+        waitForKey()
+    end
+
+    return handle
+end
+
+----------------------------------------------------------------
+-- headless junkie checks (no gui)
+--
+--   Toolkit:CheckKey(key, options) -> result
+--     options: Premium (false | true | "both"), EnforceTier, LoadScript,
+--              Service / Identifier / Provider / ScriptId (or inside Junkie = {}),
+--              Games / GamesUrl, SDK (an already loaded Junkie lib)
+--     result:  Valid, IsPremium, Tier, Reason, Error, Raw, Game
+--              Load() -> ok, err, reason     (only when Valid)
+--     Reason when not valid:
+--       missing config sdk request invalid expired hwid mismatch banned rate
+--       service premium_in_freemium freemium_in_premium
+--
+--   Toolkit:VerifyAndLoad(key, options)
+--     CheckKey + Load in one go. Adds Loaded, LoadError, LoadReason to the result.
+--
+--   local result = Toolkit:VerifyAndLoad(key, {
+--       Premium = "both",
+--       Service = "My Service", Identifier = "12345",
+--       ScriptId = { Premium = "<token>", Freemium = "<token>" },
+--   })
+--   if not result.Valid then warn(result.Reason) end
+----------------------------------------------------------------
+
+function Toolkit:CheckKey(key, options)
+    local cfg = deepMerge({
+        Premium = Toolkit.Defaults.Premium,
+        EnforceTier = Toolkit.Defaults.EnforceTier,
+        LoadScript = Toolkit.Defaults.LoadScript,
+        Junkie = Toolkit.Defaults.Junkie,
+    }, options)
+
+    local result = { Valid = false, IsPremium = false, Tier = nil, Reason = nil, Error = nil, Raw = nil }
+
+    key = trim(key)
+    if key == "" then
+        result.Reason = "missing"
+        return result
+    end
+
+    local j = cfg.Junkie
+    for _, name in ipairs({ "Service", "Identifier", "Provider", "ScriptId" }) do
+        if cfg[name] ~= nil then
+            j[name] = cfg[name]
+        end
+    end
+
+    local games = cfg.Games
+    if type(games) ~= "table" and type(cfg.GamesUrl) == "string" and cfg.GamesUrl ~= "" then
+        games = fetchGames(cfg.GamesUrl)
+    end
+    local gameEntry = findGame(games)
+    if gameEntry then
+        result.Game = gameEntry
+        j.ScriptId = { Premium = gameEntry.Premium, Freemium = gameEntry.Freemium }
+    end
+
+    local launcherPremium = cfg.Premium == true
+    local service = cleanText(pickByTier(j.Service, launcherPremium), nil)
+    local identifier = cleanText(pickByTier(j.Identifier, launcherPremium), "")
+    local provider = cleanText(pickByTier(j.Provider, launcherPremium), nil)
+
+    if not service then
+        result.Reason = "config"
+        result.Error = "Junkie.Service is missing"
+        return result
+    end
+
+    local lib = cfg.SDK
+    if not lib then
+        local loaded, err = loadSdk(j.SDKUrl)
+        if not loaded then
+            result.Reason = "sdk"
+            result.Error = err
+            return result
+        end
+        lib = loaded
+    end
+
+    lib.service = service
+    lib.identifier = identifier
+    lib.provider = provider
+
+    local startSource = resolveLoadSource(j.ScriptId, launcherPremium)
+    if startSource.Id then
+        lib.script_id = startSource.Id
+    end
+
+    local ok, response = pcall(lib.check_key, key)
+    if not ok or type(response) ~= "table" then
+        result.Reason = "request"
+        result.Error = ok and "bad response" or tostring(response)
+        return result
+    end
+    result.Raw = response
+
+    if not response.valid then
+        result.Error = response.error or response.message
+        result.Reason = classifyError(result.Error)
+        return result
+    end
+
+    local keyIsPremium = response.is_premium == true
+    result.IsPremium = keyIsPremium
+    result.Tier = keyIsPremium and "Premium" or "Freemium"
+
+    local anyTier = cfg.Premium == "both" or cfg.Premium == "auto"
+    local wantPremium = cfg.Premium == true
+    if cfg.EnforceTier ~= false and not anyTier then
+        if keyIsPremium and not wantPremium then
+            result.Reason = "premium_in_freemium"
+            return result
+        end
+        if (not keyIsPremium) and wantPremium then
+            result.Reason = "freemium_in_premium"
+            return result
+        end
+    end
+
+    result.Valid = true
+
+    local loaded, running = false, false
+    result.Load = function()
+        if loaded then
+            return true
+        end
+        if running then
+            return false, "a load is already in progress", "busy"
+        end
+
+        running = true
+        env.SCRIPT_KEY = key
+        env.TOOLKIT_KEY_PREMIUM = keyIsPremium
+        local source = resolveLoadSource(j.ScriptId, keyIsPremium)
+        local good, reason, detail, sdkErr = loadProtected(lib, key, source)
+        running = false
+
+        if good then
+            loaded = true
+            return true
+        end
+        return false, loadFailureLog(reason, detail, sdkErr), reason
+    end
+
+    return result
+end
+
+function Toolkit:VerifyAndLoad(key, options)
+    local result = Toolkit:CheckKey(key, options)
+    if not result.Valid then
+        return result
+    end
+
+    local ok, loaded, err, reason = pcall(result.Load)
+    result.Loaded = ok and loaded == true
+    if not result.Loaded then
+        result.LoadError = ok and err or tostring(loaded)
+        result.LoadReason = ok and reason or "runtime"
+        warn("[Toolkit] load failed: " .. tostring(result.LoadError))
+    end
+    return result
+end
+
+-- reachable from other scripts after the key window is gone: getgenv().Toolkit:Notify(...)
+env.Toolkit = Toolkit
+
+return Toolkit
