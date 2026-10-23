@@ -7,6 +7,7 @@ local CoreGui = game:GetService("CoreGui")
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
+local TextService = game:GetService("TextService")
 
 local LocalPlayer = Players.LocalPlayer
 local Env = (getgenv and getgenv()) or _G
@@ -14,8 +15,25 @@ local Env = (getgenv and getgenv()) or _G
 local Toolkit = {
     Version = "3.5",
     NotifName = "ToolkitKeysystem_Notifs",
-    -- editable anytime: Toolkit.Notifications.Max / .Duration
-    Notifications = { Max = 4, Duration = 4 },
+    -- editable anytime (or through Notifications = { ... } in Toolkit:Launcher):
+    --   Max          : how many toasts can show at once
+    --   Duration     : default seconds a toast stays
+    --   CornerRadius : corner of the toast. A number below 1 is a UICorner SCALE (0 = fully square,
+    --                  0.5 = pill), a number of 1 or more is PIXELS, or pass a UDim.
+    --                  Default 0.12 = squared. Use 0.35 for a rounder look.
+    --   Width        : toast width in pixels (shrinks on small screens)
+    --   TitleSize / TextSize : text sizes (bigger = easier to read)
+    --   TitleColor / TextColor : Color3 (default pure white)
+    Notifications = {
+        Max = 4,
+        Duration = 4,
+        CornerRadius = 0.12,
+        Width = 340,
+        TitleSize = 18,
+        TextSize = 15,
+        TitleColor = nil,
+        TextColor = nil,
+    },
 }
 
 -- Colors only. Sizes / layout are fixed on purpose.
@@ -107,10 +125,22 @@ Toolkit.Defaults = {
     PremiumAction = "Get Premium",
     Discord = "",
 
+    -- Mercenary-style key flow
     GetKeyLink = "",    -- fixed key link. "" = ask Junkie (Junkie.get_key_link)
+    -- (AUTO VERIFY is now a toggle button in the GUI. It starts OFF and the user turns it ON.)
     LoadScript = true,  -- true = a missing script (no matching Games entry) is reported as a config error. false = only verify the key
+                        -- when no script is configured. Ignored when a Games entry matches
     WaitForKey = true,  -- Launcher() blocks until a valid key was accepted
     KickOnBan = true,   -- kick the player when Junkie reports HWID_BANNED
+
+    -- Notification shown right after a successful verification, while the script loads.
+    -- Set WaitNotice = false to turn it off.
+    WaitNotice = {
+        Enabled = true,
+        Title = "Wait",
+        Description = "Please wait while Jnkie loads the script. It may take a while depending on Jnkie servers.",
+        Duration = 8,
+    },
 
     ToggleKey = Enum.KeyCode.RightShift,
 
@@ -832,11 +862,23 @@ end
 --   after the key GUI closes (and works without Launcher at all).
 ----------------------------------------------------------------------
 local TOAST = {
-    Height = 68,
-    Radius = 20,
-    Gap = 10,
+    MinHeight = 84,
+    Gap = 12,
     Margin = 16,
 }
+
+-- Notifications.CornerRadius -> UDim (number < 1 = scale, number >= 1 = pixels, or a UDim)
+local function ToastRadius()
+    local R = Toolkit.Notifications.CornerRadius
+    if typeof(R) == "UDim" then
+        return R
+    end
+    R = tonumber(R) or 0.12
+    if R < 1 then
+        return UDim.new(math.max(R, 0), 0)
+    end
+    return UDim.new(0, R)
+end
 
 local Notif = { Gui = nil, Holder = nil, Width = 300, Toasts = {}, Counter = 0 }
 local NoToast = { Dismiss = function() end }
@@ -850,7 +892,7 @@ local function EnsureNotif()
 
     local Camera = workspace.CurrentCamera
     local V = Camera and Camera.ViewportSize or Vector2.new(1280, 720)
-    Notif.Width = math.clamp(V.X - TOAST.Margin * 2, 230, 300)
+    Notif.Width = math.clamp(V.X - TOAST.Margin * 2, 240, tonumber(Toolkit.Notifications.Width) or 340)
     Notif.Toasts = {}
 
     Notif.Gui = NewScreenGui(Toolkit.NotifName, 1000000)
@@ -902,9 +944,29 @@ function Toolkit:Notify(Title, Text, Kind, Opts)
 
     Notif.Counter = Notif.Counter + 1
 
+    -- bigger, higher-contrast text; the toast grows to fit the description
+    local Cfg = Toolkit.Notifications
+    local TitleSize = tonumber(Cfg.TitleSize) or 18
+    local TextSize = tonumber(Cfg.TextSize) or 15
+    local TextLeft = 74
+    local TextWidth = Notif.Width - TextLeft - 16
+    local TitleColor = Cfg.TitleColor or Theme.Text
+    local BodyColor = Cfg.TextColor or Theme.Text
+    local TextHeight = TextSize + 4
+    local Measured, MeasureText = pcall(function()
+        return TextService:GetTextSize(tostring(Text), TextSize, Enum.Font.GothamMedium, Vector2.new(TextWidth, 10000))
+    end)
+    if Measured and typeof(MeasureText) == "Vector2" then
+        TextHeight = math.ceil(MeasureText.Y) + 2
+    else
+        local Lines = math.max(1, math.ceil(#tostring(Text) * TextSize * 0.55 / TextWidth))
+        TextHeight = Lines * (TextSize + 3)
+    end
+    local ToastHeight = math.max(TOAST.MinHeight, 14 + (TitleSize + 6) + 4 + TextHeight + 14 + 8 + 10)
+
     local Wrap = New("Frame", {
         Name = "Toast",
-        Size = UDim2.new(1, 0, 0, TOAST.Height),
+        Size = UDim2.new(1, 0, 0, ToastHeight),
         BackgroundTransparency = 1,
         LayoutOrder = -Notif.Counter,
     }, NotifHolder)
@@ -914,7 +976,7 @@ function Toolkit:Notify(Title, Text, Kind, Opts)
         BackgroundTransparency = 1,
     }, Wrap)
 
-    Glow(Slider, Color, 46, 0.84, 1)
+    Glow(Slider, Color, 46, 0.6, 1)
 
     local Card = New("Frame", {
         Size = UDim2.fromScale(1, 1),
@@ -922,69 +984,71 @@ function Toolkit:Notify(Title, Text, Kind, Opts)
         BorderSizePixel = 0,
         ZIndex = 2,
     }, Slider)
-    Corner(Card, TOAST.Radius)
-    Gradient(Card, Theme.Bg2, Theme.Bg, 135)
-    local CardStroke = Stroke(Card, White, 1.5, 0.2)
-    Gradient(CardStroke, Color, Theme.Stroke, 45)
+    local Radius = ToastRadius()
+    New("UICorner", { CornerRadius = Radius }, Card)
+    Gradient(Card, Theme.Bg, Theme.Bg, 135)
+    local CardStroke = Stroke(Card, Color, 2.5, 0)
 
     local Badge = New("Frame", {
-        Position = UDim2.fromOffset(14, 12),
-        Size = UDim2.fromOffset(36, 36),
+        Position = UDim2.fromOffset(14, 14),
+        Size = UDim2.fromOffset(46, 46),
         BackgroundColor3 = Color,
-        BackgroundTransparency = 0.82,
+        BackgroundTransparency = 0.7,
         BorderSizePixel = 0,
         ZIndex = 3,
     }, Card)
-    Corner(Badge, 18)
-    Stroke(Badge, Color, 1.2, 0.55)
+    New("UICorner", { CornerRadius = Radius }, Badge)
+    Stroke(Badge, Color, 2, 0)
     local BadgePop = New("UIScale", { Scale = 0 }, Badge)
     Label(Badge, {
         Size = UDim2.fromScale(1, 1),
         Text = Icon,
         TextColor3 = Color,
-        TextSize = 17,
+        TextSize = 28,
         Font = Enum.Font.GothamBlack,
         TextXAlignment = Enum.TextXAlignment.Center,
         ZIndex = 4,
     })
 
     Label(Card, {
-        Position = UDim2.fromOffset(62, 10),
-        Size = UDim2.new(1, -76, 0, 16),
+        Position = UDim2.fromOffset(TextLeft, 12),
+        Size = UDim2.new(1, -(TextLeft + 14), 0, TitleSize + 6),
         Text = Title,
-        TextSize = 13,
-        Font = Enum.Font.GothamBold,
+        TextColor3 = TitleColor,
+        TextSize = TitleSize,
+        Font = Enum.Font.GothamBlack,
         TextTruncate = Enum.TextTruncate.AtEnd,
         ZIndex = 3,
     })
     Label(Card, {
-        Position = UDim2.fromOffset(62, 27),
-        Size = UDim2.new(1, -76, 0, 26),
+        Position = UDim2.fromOffset(TextLeft, 12 + TitleSize + 10),
+        Size = UDim2.new(1, -(TextLeft + 14), 0, TextHeight),
         Text = Text,
-        TextColor3 = Theme.Muted,
-        TextSize = 11,
+        TextColor3 = BodyColor,
+        TextSize = TextSize,
+        Font = Enum.Font.GothamMedium,
         TextWrapped = true,
         TextYAlignment = Enum.TextYAlignment.Top,
         ZIndex = 3,
     })
 
     local Track = New("Frame", {
-        Position = UDim2.new(0, 18, 1, -12),
-        Size = UDim2.new(1, -36, 0, 4),
+        Position = UDim2.new(0, 14, 1, -18),
+        Size = UDim2.new(1, -28, 0, 8),
         BackgroundColor3 = Color,
-        BackgroundTransparency = 0.85,
+        BackgroundTransparency = 0.7,
         BorderSizePixel = 0,
         ZIndex = 3,
     }, Card)
-    Corner(Track, 2)
+    New("UICorner", { CornerRadius = Radius }, Track)
     local Bar = New("Frame", {
         Size = Fill and UDim2.fromScale(0, 1) or UDim2.fromScale(1, 1),
         BackgroundColor3 = White,
         BorderSizePixel = 0,
         ZIndex = 4,
     }, Track)
-    Corner(Bar, 2)
-    Gradient(Bar, Color, Color:Lerp(White, 0.45), 0)
+    New("UICorner", { CornerRadius = Radius }, Bar)
+    Gradient(Bar, Color, Color:Lerp(White, 0.3), 0)
 
     local Handle = { Tag = Opts.Tag, Gone = false }
     table.insert(Toasts, Handle)
@@ -1022,8 +1086,8 @@ function Toolkit:Notify(Title, Text, Kind, Opts)
         ZIndex = 8,
     }, Card)
     Click.MouseButton1Click:Connect(function() Handle.Dismiss() end)
-    Click.MouseEnter:Connect(function() Tween(CardStroke, 0.15, { Transparency = 0 }) end)
-    Click.MouseLeave:Connect(function() Tween(CardStroke, 0.15, { Transparency = 0.2 }) end)
+    Click.MouseEnter:Connect(function() Tween(CardStroke, 0.15, { Transparency = 0.25 }) end)
+    Click.MouseLeave:Connect(function() Tween(CardStroke, 0.15, { Transparency = 0 }) end)
 
     Tween(Slider, 0.45, { Position = UDim2.fromOffset(0, 0) }, Enum.EasingStyle.Back)
     task.delay(0.15, function()
@@ -1900,11 +1964,21 @@ function Toolkit:Launcher(Options)
             DestroyUI()
 
             -- load the script after a valid key (works in any game)
-            -- the "Wait" toast is shown only after the script load succeeded
+            -- the "Wait" toast (Config.WaitNotice) is shown right after the key is verified, before the load starts
             local function NotifyWait()
-                Toolkit:Notify("Wait", "May take longer to load depending on jnkie servers.", "info", {
-                    Duration = 8, Tag = "load",
-                })
+                local Notice = Config.WaitNotice
+                if Notice == false or (type(Notice) == "table" and Notice.Enabled == false) then
+                    return
+                end
+                if type(Notice) ~= "table" then
+                    Notice = {}
+                end
+                Toolkit:Notify(
+                    tostring(Notice.Title or "Wait"),
+                    tostring(Notice.Description or "Please wait while Jnkie loads the script. It may take a while depending on Jnkie servers."),
+                    "info",
+                    { Duration = tonumber(Notice.Duration) or 8, Tag = "load" }
+                )
             end
 
             local WaitedAt = os.clock()
@@ -1914,10 +1988,9 @@ function Toolkit:Launcher(Options)
 
             local Source = ResolveLoadSource(Config.GameScript, KeyIsPremium)
             if Source.Given or Config.LoadScript ~= false then
+                NotifyWait()
                 local Loaded, Reason, Detail, SDKErr = LoadProtected(Junkie, Key, Source)
-                if Loaded then
-                    NotifyWait()
-                else
+                if not Loaded then
                     warn("[Toolkit] load failed: " .. LoadFailureLog(Reason, Detail, SDKErr))
                     local Text = LoadToastText(Reason, Detail)
                     if Reason == "no_source" or Reason == "bad_url" then
